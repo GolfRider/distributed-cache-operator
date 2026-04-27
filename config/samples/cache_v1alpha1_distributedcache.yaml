@@ -1,0 +1,9 @@
+apiVersion: cache.sk1.services.com/v1alpha1
+kind: DistributedCache
+metadata:
+  labels:
+    app.kubernetes.io/name: distributed-cache-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: distributedcache-sample
+spec:
+  # TODO(user): Add fields here

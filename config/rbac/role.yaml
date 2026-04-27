@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - cache.sk1.services.com
+  resources:
+  - distributedcaches
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cache.sk1.services.com
+  resources:
+  - distributedcaches/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - cache.sk1.services.com
+  resources:
+  - distributedcaches/status
+  verbs:
+  - get
+  - patch
+  - update
