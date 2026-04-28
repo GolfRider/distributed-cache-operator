@@ -100,3 +100,89 @@ via `+kubebuilder:printcolumn` markers so `kubectl get distributedcache`
 returns something meaningful by default, rather than just name and age.
 This is a small polish that signals operational familiarity.
 
+
+---
+
+## 2. Reconciler model and the headless Service
+
+### Level-triggered reconciliation
+
+The reconciler is level-triggered, not edge-triggered. It is never told what
+*changed*; it is told the namespaced name of a CR and is expected to observe
+the world from scratch and make one step's worth of progress, idempotently.
+This is non-negotiable for two reasons. First, it is self-healing: a crash
+or restart costs nothing because the next reconcile reads fresh state and
+continues from observation. Second, it composes — multiple reconcile triggers
+(spec edit, owned-resource event, periodic resync) collapse to "go look at
+the world again," which is the same code path. Every reconcile must therefore
+be safe to run any number of times against the same state.
+
+In practice this discipline shows up in three places: `controllerutil.CreateOrUpdate`
+for owned resources (read-mutate-write atomically, no separate create vs
+update branch), `meta.SetStatusCondition` for conditions (no-op when nothing
+changed, including LastTransitionTime), and the no-cleanup-code rule for
+owned resources (Kubernetes garbage collection via owner references handles
+it).
+
+### The headless Service
+
+The first owned resource is a headless Service (`clusterIP: None`). A normal
+Service load-balances traffic across its endpoints; a headless Service
+returns per-pod DNS records (`cache-0.<svc>.<ns>.svc.cluster.local`) and
+performs no balancing. Because clients use consistent hashing to route to
+specific pods, load-balancing would defeat the design — we *want* the client
+addressing pods individually. The Service is therefore a pure DNS-and-identity
+primitive, not a traffic primitive.
+
+`PublishNotReadyAddresses` is set to false, deliberately. When the operator
+flips a pod to NotReady during drain, that pod's DNS record disappears
+within seconds. Clients (after their next ring poll) will already have
+removed the pod from their consistent hash; the DNS-level removal is a
+belt-and-suspenders signal that the pod is no longer a valid target. See
+section 3 ("Drain and the ring-staleness contract", forthcoming) for how
+this composes with the operator-published ring.
+
+### Labels, selectors, and the immutability rule
+
+Owned resources carry the four recommended `app.kubernetes.io/*` labels
+(name, instance, managed-by, component). These are identity stamps used by
+generic Kubernetes tooling — `kubectl get -l`, Prometheus relabeling,
+GitOps tools — and following the convention buys ecosystem integration for
+free. The reconciler asserts these labels every reconcile via `CreateOrUpdate`'s
+mutate function, so manual edits or other controllers' label drift heal
+automatically.
+
+The Service's `spec.selector` is intentionally narrower than the Service's
+own labels: only `app.kubernetes.io/name` and `app.kubernetes.io/instance`
+are used. Selectors are immutable on Services, and including a label that
+might evolve over the cluster's lifetime (`version`, `component`) would
+either force selector drift or force a Service replacement during otherwise
+routine changes. The selector's contract is "the pods this Service routes
+to, forever" — so the labels in it must be ones that never change for
+the lifetime of the cache cluster.
+
+### Owner references and watches
+
+Every owned resource is created with a controller reference pointing at the
+parent CR (`controllerutil.SetControllerReference`). Two consequences. First,
+deletion is automatic: when the CR is deleted, Kubernetes' garbage collector
+walks owner references and deletes everything stamped as owned, with no
+operator code involved. Second, the reverse-watch pattern: `Owns(&corev1.Service{})`
+in `SetupWithManager` registers a watch on Services, and any event on a
+Service whose owner reference points at a DistributedCache re-enqueues the
+*parent* CR for reconciliation. This is the mechanism that turns "manual
+delete of an owned resource" into "operator recreates it within seconds"
+— the watch graph plus level-triggered reconciliation gives self-healing
+without polling.
+
+### Failure as a status condition, not a log line
+
+When an owned-resource reconcile fails, the reconciler sets `Degraded=True`
+with a specific reason (e.g. `ServiceReconcileFailed`), best-effort updates
+status, and returns the original error so controller-runtime's exponential
+backoff retries. This is the discipline that separates an operator that's
+actually operable from one that requires log-spelunking to debug: every
+failure mode must surface in `kubectl describe` with a stable reason that
+monitoring can match on. Log lines are for operators of the operator;
+conditions are for users of the CR.
+
