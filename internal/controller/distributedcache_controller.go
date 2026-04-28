@@ -1,24 +1,12 @@
-/*
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,7 +15,23 @@ import (
 	cachev1alpha1 "github.com/GolfRider/distributed-cache-operator/api/v1alpha1"
 )
 
-// DistributedCacheReconciler reconciles a DistributedCache object
+// Condition types — exported so clients and tests can reference the same constants.
+const (
+	ConditionAvailable      = "Available"
+	ConditionProgressing    = "Progressing"
+	ConditionDegraded       = "Degraded"
+	ConditionTenantIsolated = "TenantIsolated"
+)
+
+// Condition reasons.
+const (
+	ReasonReconciled     = "Reconciled"
+	ReasonInitializing   = "Initializing"
+	ReasonNotRequested   = "NotRequested"
+	ReasonNotImplemented = "NotImplemented"
+)
+
+// DistributedCacheReconciler reconciles a DistributedCache object.
 type DistributedCacheReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -37,24 +41,90 @@ type DistributedCacheReconciler struct {
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the DistributedCache object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+// Reconcile observes a DistributedCache and moves the cluster one step closer
+// to the desired state. The function is called level-triggered: it never
+// receives deltas, only the namespaced name of the CR to inspect.
 func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	// 1. Fetch the CR.
+	var cache cachev1alpha1.DistributedCache
+	if err := r.Get(ctx, req.NamespacedName, &cache); err != nil {
+		// IsNotFound is the expected path when a CR has been deleted; the
+		// reconciler is invoked one last time with the now-gone object's name.
+		// Owner references take care of GC for owned resources, so we just exit.
+		if apierrors.IsNotFound(err) {
+			log.V(1).Info("DistributedCache not found; assuming deleted")
+			return ctrl.Result{}, nil
+		}
+		// Any other error is a transient API failure — return it to trigger
+		// controller-runtime's exponential backoff retry.
+		return ctrl.Result{}, fmt.Errorf("get DistributedCache: %w", err)
+	}
+
+	log.Info("reconciling", "generation", cache.Generation, "replicas", cache.Spec.Replicas)
+
+	// 2. Compute the new condition set. For now this is a placeholder set
+	//    that says "we observed the object but haven't done anything yet."
+	//    Each branch in the real reconciler will set these more precisely.
+	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+		Type:               ConditionAvailable,
+		Status:             metav1.ConditionFalse,
+		Reason:             ReasonInitializing,
+		Message:            "Reconciler observed the resource; owned resources not yet created.",
+		ObservedGeneration: cache.Generation,
+	})
+	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+		Type:               ConditionProgressing,
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonInitializing,
+		Message:            "Initial reconcile in progress.",
+		ObservedGeneration: cache.Generation,
+	})
+	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+		Type:               ConditionDegraded,
+		Status:             metav1.ConditionFalse,
+		Reason:             ReasonReconciled,
+		Message:            "No degraded conditions observed.",
+		ObservedGeneration: cache.Generation,
+	})
+	if cache.Spec.Tenant != nil && cache.Spec.Tenant.Isolate {
+		meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+			Type:               ConditionTenantIsolated,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonNotImplemented,
+			Message:            "Tenant isolation accepted by API but not yet wired.",
+			ObservedGeneration: cache.Generation,
+		})
+	} else {
+		meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+			Type:               ConditionTenantIsolated,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonNotRequested,
+			Message:            "spec.tenant.isolate is unset or false.",
+			ObservedGeneration: cache.Generation,
+		})
+	}
+
+	// 3. Record observedGeneration so clients can tell the controller has
+	//    caught up to the latest spec, even if no other status field changed.
+	cache.Status.ObservedGeneration = cache.Generation
+
+	// 4. Persist status. Status writes go through the /status subresource,
+	//    not the main endpoint — using r.Update here would silently drop the
+	//    status changes.
+	if err := r.Status().Update(ctx, &cache); err != nil {
+		// Conflict means another writer touched the object between our Get and
+		// Update. Return the error and let controller-runtime requeue; the next
+		// reconcile reads fresh state and tries again.
+		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
+	}
 
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager. The watch graph
+// declared here defines what events trigger a reconcile.
 func (r *DistributedCacheReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.DistributedCache{}).
