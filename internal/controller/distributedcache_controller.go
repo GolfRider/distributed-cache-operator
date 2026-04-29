@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -47,11 +48,12 @@ const (
 // Condition reasons. Treat these as part of the API contract: monitoring and
 // alerting will key on these strings, so renames are breaking changes.
 const (
-	ReasonReconciled     = "Reconciled"
-	ReasonInitializing   = "Initializing"
-	ReasonNotRequested   = "NotRequested"
-	ReasonNotImplemented = "NotImplemented"
-	ReasonServiceFailed  = "ServiceReconcileFailed"
+	ReasonReconciled        = "Reconciled"
+	ReasonInitializing      = "Initializing"
+	ReasonNotRequested      = "NotRequested"
+	ReasonNotImplemented    = "NotImplemented"
+	ReasonServiceFailed     = "ServiceReconcileFailed"
+	ReasonStatefulSetFailed = "StatefulSetReconcileFailed"
 )
 
 // Standard recommended labels propagated to every owned resource.
@@ -64,6 +66,10 @@ const (
 	appName        = "distributed-cache"
 	managedByValue = "distributed-cache-operator"
 )
+
+// Cache pod HTTP port. The cache binary listens here for kv operations,
+// /readyz, /healthz, and /metrics.
+const cachePort int32 = 8080
 
 // DistributedCacheReconciler reconciles a DistributedCache object.
 //
@@ -81,6 +87,7 @@ type DistributedCacheReconciler struct {
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives a DistributedCache toward its desired state. It is
 // level-triggered: every invocation re-observes the world from scratch and
@@ -88,8 +95,6 @@ type DistributedCacheReconciler struct {
 func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// 1. Fetch the CR. NotFound is the normal path when a CR has been deleted;
-	//    return nil so controller-runtime stops requeueing this name.
 	var cache cachev1alpha1.DistributedCache
 	if err := r.Get(ctx, req.NamespacedName, &cache); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -105,29 +110,21 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		"image", cache.Spec.Image,
 	)
 
-	// 2. Reconcile owned resources.
 	if err := r.reconcileService(ctx, &cache); err != nil {
-		// Record the failure into a condition so users see it in
-		// `kubectl describe` rather than only in operator logs.
-		meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
-			Type:               ConditionDegraded,
-			Status:             metav1.ConditionTrue,
-			Reason:             ReasonServiceFailed,
-			Message:            fmt.Sprintf("headless Service reconcile failed: %v", err),
-			ObservedGeneration: cache.Generation,
-		})
-		// Best-effort status persist before returning the error;
-		// if even the status write fails, propagate the original error.
+		r.markDegraded(&cache, ReasonServiceFailed, err)
 		_ = r.Status().Update(ctx, &cache)
 		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
 
-	// 3. Compute conditions for the steady "observed" state. Once owned
-	//    resources are healthy in later steps, Available will flip True.
+	if err := r.reconcileStatefulSet(ctx, &cache); err != nil {
+		r.markDegraded(&cache, ReasonStatefulSetFailed, err)
+		_ = r.Status().Update(ctx, &cache)
+		return ctrl.Result{}, fmt.Errorf("reconcile statefulset: %w", err)
+	}
+
 	cache.Status.ObservedGeneration = cache.Generation
 	r.setInitializingConditions(&cache)
 
-	// 4. Persist status via the /status subresource.
 	if err := r.Status().Update(ctx, &cache); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
@@ -135,11 +132,32 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{}, nil
 }
 
-// reconcileService ensures a headless Service exists for this cache and has
-// the right shape. The Service has clusterIP=None so its DNS record returns
-// per-pod IPs (cache-0.<svc>, cache-1.<svc>, ...) — clients address pods
-// directly by name, since consistent hashing means load-balancing would be
-// counterproductive.
+// markDegraded sets the Degraded condition with the given reason and the
+// error's message. Used in error paths to make failures visible in
+// `kubectl describe` rather than only in operator logs.
+func (r *DistributedCacheReconciler) markDegraded(cache *cachev1alpha1.DistributedCache, reason string, err error) {
+	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+		Type:               ConditionDegraded,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            err.Error(),
+		ObservedGeneration: cache.Generation,
+	})
+}
+
+// podLabels returns the labels that uniquely identify pods for a given
+// DistributedCache. Used both as labels stamped on pods (via the StatefulSet
+// pod template) and as the selector on the Service. Matching on both sides
+// is what makes the Service's DNS resolution find the pods.
+func podLabels(cache *cachev1alpha1.DistributedCache) map[string]string {
+	return map[string]string{
+		labelName:     appName,
+		labelInstance: cache.Name,
+	}
+}
+
+// reconcileService ensures a headless Service exists for this cache.
+// See DESIGN.md §2 for the headless-Service rationale.
 func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
 	log := logf.FromContext(ctx)
 
@@ -150,14 +168,7 @@ func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache
 		},
 	}
 
-	// CreateOrUpdate handles three cases idempotently:
-	//   - Service does not exist: the mutate fn shapes a fresh object, then Create.
-	//   - Service exists, matches desired shape: no API write performed.
-	//   - Service exists, differs: mutate fn updates only the fields we set,
-	//     then Update — preserving server-set fields we don't touch.
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
-		// Labels: idempotent merge. We assert the keys we own; any keys
-		// added by other tools (Istio, kustomize commonLabels) are preserved.
 		if svc.Labels == nil {
 			svc.Labels = map[string]string{}
 		}
@@ -166,38 +177,22 @@ func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache
 		svc.Labels[labelManagedBy] = managedByValue
 		svc.Labels[labelComponent] = "cache"
 
-		// Spec: shape the headless Service.
-		// ClusterIPNone is the magic value that disables load-balancing and
-		// makes DNS return per-pod records.
 		svc.Spec.ClusterIP = corev1.ClusterIPNone
-		svc.Spec.Selector = map[string]string{
-			labelName:     appName,
-			labelInstance: cache.Name,
-		}
+		svc.Spec.Selector = podLabels(cache)
 		svc.Spec.Ports = []corev1.ServicePort{{
 			Name:       "http",
-			Port:       8080,
-			TargetPort: intstr.FromInt32(8080),
+			Port:       cachePort,
+			TargetPort: intstr.FromInt32(cachePort),
 			Protocol:   corev1.ProtocolTCP,
 		}}
-		// PublishNotReadyAddresses=false: when a pod goes NotReady, its DNS
-		// record is removed. The drain logic relies on this — flipping a pod
-		// to NotReady is how the operator removes it from client traffic
-		// before the pod actually terminates.
 		svc.Spec.PublishNotReadyAddresses = false
 
-		// SetControllerReference writes ownerReferences pointing at the CR.
-		// This makes the Service garbage-collected on CR deletion and
-		// enables our Owns(&Service{}) watch to re-enqueue the parent on
-		// any Service event.
 		return controllerutil.SetControllerReference(cache, svc, r.Scheme)
 	})
 	if err != nil {
 		return fmt.Errorf("CreateOrUpdate Service: %w", err)
 	}
 
-	// Emit a Kubernetes event only when something actually changed.
-	// OperationResultNone means the Service was already in desired state.
 	if op != controllerutil.OperationResultNone {
 		log.Info("reconciled headless Service", "operation", op, "name", svc.Name)
 		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "ServiceReconciled",
@@ -207,10 +202,123 @@ func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache
 	return nil
 }
 
+// reconcileStatefulSet ensures a StatefulSet exists for this cache, with
+// the right replicas, image, resources, and probes. Each pod gets a stable
+// DNS name (cache-0.<svc>, cache-1.<svc>, ...) which the consistent-hash
+// ring math depends on.
+func (r *DistributedCacheReconciler) reconcileStatefulSet(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+	log := logf.FromContext(ctx)
+
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cache.Name,
+			Namespace: cache.Namespace,
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		// Labels on the StatefulSet itself.
+		if sts.Labels == nil {
+			sts.Labels = map[string]string{}
+		}
+		sts.Labels[labelName] = appName
+		sts.Labels[labelInstance] = cache.Name
+		sts.Labels[labelManagedBy] = managedByValue
+		sts.Labels[labelComponent] = "cache"
+
+		// Replicas, mutable.
+		sts.Spec.Replicas = cache.Spec.Replicas
+
+		// Immutable fields: only set on creation. The API server rejects
+		// updates that change selector, serviceName, or volumeClaimTemplates,
+		// so guarding by CreationTimestamp prevents our reconciler from
+		// generating unfixable Update errors after the StatefulSet exists.
+		if sts.CreationTimestamp.IsZero() {
+			sts.Spec.ServiceName = cache.Name // pairs with the headless Service
+			sts.Spec.Selector = &metav1.LabelSelector{
+				MatchLabels: podLabels(cache),
+			}
+			sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
+			// OrderedReady is the default; Parallel lets pods come up
+			// concurrently. For a stateless cache there's no startup
+			// ordering requirement, and Parallel makes scale-up faster.
+		}
+
+		// Pod template — mutable; updates trigger a rolling restart.
+		sts.Spec.Template.Labels = podLabels(cache)
+
+		// TerminationGracePeriodSeconds: must give the operator enough time
+		// to publish a ring removal *and* the pod enough time to finish
+		// in-flight requests. The drain logic waits drain.gracePeriodSeconds
+		// after marking the pod NotReady; we add 10s of headroom for the
+		// cache's own graceful shutdown.
+		grace := int64(cache.Spec.Drain.GracePeriodSeconds) + 10
+		sts.Spec.Template.Spec.TerminationGracePeriodSeconds = &grace
+
+		// Container.
+		container := corev1.Container{
+			Name:  "cache",
+			Image: cache.Spec.Image,
+			Ports: []corev1.ContainerPort{{
+				Name:          "http",
+				ContainerPort: cachePort,
+				Protocol:      corev1.ProtocolTCP,
+			}},
+			Resources: corev1.ResourceRequirements{
+				// Requests == Limits: predictable Guaranteed QoS class.
+				// The cache is memory-bound; we don't pin CPU on purpose
+				// (see DESIGN.md §1 on why CPU isn't in the spec).
+				Requests: corev1.ResourceList{
+					corev1.ResourceMemory: cache.Spec.MemoryPerPod,
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: cache.Spec.MemoryPerPod,
+				},
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path: "/readyz",
+						Port: intstr.FromInt32(cachePort),
+					},
+				},
+				PeriodSeconds:    2,
+				TimeoutSeconds:   1,
+				FailureThreshold: 3,
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path: "/healthz",
+						Port: intstr.FromInt32(cachePort),
+					},
+				},
+				PeriodSeconds:    10,
+				TimeoutSeconds:   2,
+				FailureThreshold: 3,
+			},
+		}
+		sts.Spec.Template.Spec.Containers = []corev1.Container{container}
+
+		return controllerutil.SetControllerReference(cache, sts, r.Scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("CreateOrUpdate StatefulSet: %w", err)
+	}
+
+	if op != controllerutil.OperationResultNone {
+		log.Info("reconciled StatefulSet", "operation", op, "name", sts.Name)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "StatefulSetReconciled",
+			"StatefulSet %s/%s %s", sts.Namespace, sts.Name, op)
+	}
+
+	return nil
+}
+
 // setInitializingConditions sets the four conditions to a coherent
 // "we observed the object but haven't finished bringing up the data plane"
-// state. As we add StatefulSet and ring reconciliation, this helper will
-// be replaced with logic that reflects real readiness.
+// state. As we add ring reconciliation, this helper will be replaced with
+// logic that reflects real readiness from the StatefulSet's status.
 func (r *DistributedCacheReconciler) setInitializingConditions(cache *cachev1alpha1.DistributedCache) {
 	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
 		Type:               ConditionAvailable,
@@ -250,14 +358,14 @@ func (r *DistributedCacheReconciler) setInitializingConditions(cache *cachev1alp
 }
 
 // SetupWithManager wires the reconciler into the manager. The Owns calls
-// register watches on owned resources: any change to a child Service we own
-// re-enqueues the parent CR for reconciliation, which is how owned-state
-// drift heals automatically.
+// register watches on owned resources: any change to a child Service or
+// StatefulSet we own re-enqueues the parent CR for reconciliation.
 func (r *DistributedCacheReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("distributedcache-controller")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.DistributedCache{}).
 		Owns(&corev1.Service{}).
+		Owns(&appsv1.StatefulSet{}).
 		Named("distributedcache").
 		Complete(r)
 }
