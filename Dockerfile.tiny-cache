@@ -1,0 +1,38 @@
+# Dockerfile.tiny-cache
+# Build the tiny-cache data-plane binary as a minimal scratch image.
+# The control plane lives in distributed-cache-operator; this is the data
+# plane it manages.
+
+# Build stage: compile a static binary with no CGO, so it runs on scratch.
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /workspace
+
+# Cache module downloads in a separate layer.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy only what tiny-cache needs to build. The api/, internal/controller/,
+# and config/ directories belong to the operator and are intentionally
+# excluded — keeping the build context narrow makes incremental builds fast.
+COPY cmd/tiny-cache/ cmd/tiny-cache/
+COPY internal/cache/ internal/cache/
+
+# Static binary: CGO_ENABLED=0 + -ldflags=-s -w to strip symbols and DWARF.
+# GOOS/GOARCH respect the BuildKit build platform so cross-builds work.
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /out/tiny-cache ./cmd/tiny-cache
+
+# Runtime stage: scratch is ~0 bytes; nothing to attack, nothing to debug
+# beyond what the binary itself provides. The binary listens on 8080;
+# the rest is up to operator-managed config (flags) and Kubernetes (probes,
+# resource limits, signals).
+FROM scratch
+
+COPY --from=builder /out/tiny-cache /tiny-cache
+
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/tiny-cache"]

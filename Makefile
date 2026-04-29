@@ -123,6 +123,16 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+##@ Tiny-cache (data plane)
+
+.PHONY: docker-build-tiny-cache
+docker-build-tiny-cache: ## Build the tiny-cache image.
+	$(CONTAINER_TOOL) build -t tiny-cache:dev -f Dockerfile.tiny-cache .
+
+.PHONY: kind-load-tiny-cache
+kind-load-tiny-cache: docker-build-tiny-cache ## Build and load tiny-cache into kind.
+	kind load docker-image tiny-cache:dev --name dcache-dev
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/

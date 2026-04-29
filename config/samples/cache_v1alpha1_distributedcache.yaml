@@ -5,7 +5,7 @@ metadata:
   namespace: default
 spec:
   replicas: 3
-  image: ghcr.io/golfrider/tiny-cache:0.1.0
+  image: tiny-cache:dev
   memoryPerPod: 128Mi
   drain:
     gracePeriodSeconds: 30
