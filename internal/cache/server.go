@@ -1,4 +1,3 @@
-// internal/cache/server.go
 /*
 Copyright 2026.
 
@@ -17,11 +16,6 @@ limitations under the License.
 
 // Package cache implements the tiny-cache data-plane server: a single-node,
 // peer-unaware, in-memory KV cache with HTTP API.
-//
-// The server is intentionally minimal — no replication, no persistence, no
-// gossip. Coordination (membership, ring publication, drain) is the
-// operator's job; this package only knows how to serve gets, puts, and
-// deletes against a local LRU.
 package cache
 
 import (
@@ -34,21 +28,24 @@ import (
 	"time"
 )
 
-// Config holds tiny-cache server configuration. Constructed by main.go.
+// Config holds tiny-cache server configuration.
 type Config struct {
-	Listen string
-	Logger *slog.Logger
+	Listen     string
+	Logger     *slog.Logger
+	Capacity   int           // max entries in the LRU
+	DefaultTTL time.Duration // applied to every PUT
 }
 
 // Run starts the tiny-cache server and blocks until ctx is cancelled.
-// On cancellation, it triggers a graceful shutdown bounded by the
-// shutdown timeout below.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		return errors.New("Config.Logger is required")
 	}
 	if cfg.Listen == "" {
 		return errors.New("Config.Listen is required")
+	}
+	if cfg.Capacity <= 0 {
+		return errors.New("Config.Capacity must be > 0")
 	}
 
 	srv := newServer(cfg)
@@ -59,15 +56,14 @@ func Run(ctx context.Context, cfg Config) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Run the listener on a goroutine; capture its error via channel so the
-	// main path can wait on either ctx.Done or a listener failure.
 	listenErr := make(chan error, 1)
 	go func() {
-		cfg.Logger.Info("tiny-cache listening", "addr", cfg.Listen)
-		// ListenAndServe blocks until Shutdown or a hard error.
+		cfg.Logger.Info("tiny-cache listening",
+			"addr", cfg.Listen,
+			"capacity", cfg.Capacity,
+			"default_ttl", cfg.DefaultTTL,
+		)
 		err := httpSrv.ListenAndServe()
-		// http.ErrServerClosed is the expected error from a clean shutdown;
-		// translate to nil so callers don't see it as a failure.
 		if errors.Is(err, http.ErrServerClosed) {
 			listenErr <- nil
 			return
@@ -75,7 +71,6 @@ func Run(ctx context.Context, cfg Config) error {
 		listenErr <- err
 	}()
 
-	// Wait for either a signal-driven shutdown or a listener error.
 	select {
 	case <-ctx.Done():
 		cfg.Logger.Info("shutdown signal received; draining")
@@ -83,25 +78,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("listen: %w", err)
 		}
-		// Listener closed without error before any signal — unusual but treat
-		// as clean exit.
 		return nil
 	}
 
-	// Mark the server NotReady so the readiness probe fails immediately.
-	// Existing connections continue; no new traffic is routed here.
 	srv.markNotReady()
 
-	// Bounded graceful shutdown. Existing in-flight requests finish; new
-	// connections are refused. After the timeout, ListenAndServe returns
-	// regardless and any leftover handlers are abandoned.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 
-	// Drain the listener-error channel after shutdown to avoid a goroutine leak.
 	if err := <-listenErr; err != nil {
 		return err
 	}
@@ -109,41 +96,31 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 // server holds the runtime state of a tiny-cache instance.
-//
-// `ready` is atomic so the readiness handler can be lock-free; the operator's
-// drain logic depends on /readyz responses changing within milliseconds of
-// the markNotReady call.
 type server struct {
 	logger *slog.Logger
+	store  *Store
 	ready  atomic.Bool
 }
 
 func newServer(cfg Config) *server {
-	s := &server{logger: cfg.Logger}
+	s := &server{
+		logger: cfg.Logger,
+		store:  NewStore(cfg.Capacity, cfg.DefaultTTL),
+	}
 	s.ready.Store(true)
 	return s
 }
 
 func (s *server) markNotReady() { s.ready.Store(false) }
 
-// routes registers HTTP handlers. The KV handlers, /metrics, and the actual
-// LRU come in a follow-up commit; this skeleton has only the probes so we
-// can verify the build and signal handling end-to-end.
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// /healthz: liveness — process is up, mux is responding.
-	// Always 200 unless the process has crashed (in which case the kernel
-	// returns RST and the probe fails at the TCP level).
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	// /readyz: readiness — the process is willing to serve traffic.
-	// Flips to 503 when shutdown begins. The operator's drain logic relies
-	// on this signal: kubelet observes 503, marks the pod NotReady, the
-	// Service removes the pod's DNS record, clients stop targeting it.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if !s.ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -153,6 +130,10 @@ func (s *server) routes() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+
+	// KV endpoints. Stdlib mux dispatches by path prefix; the handler
+	// extracts the key and dispatches by method.
+	mux.HandleFunc("/kv/", s.kvHandler)
 
 	return mux
 }
