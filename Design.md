@@ -279,3 +279,107 @@ Pods directly via `Watches(...)` with a custom mapper — is more code and
 more watch budget for a marginal latency improvement. Documented as
 intentional rather than missing.
 
+
+---
+
+## 5. Drain and the ring-staleness contract
+
+The operator coordinates pod removal with client ring updates so that no
+client routes traffic to a pod that's actively being terminated. This is
+the most non-trivial control-plane behavior in the project and the one
+that justifies an operator over a hand-rolled StatefulSet + Service.
+
+### The asymmetry: scale-up vs scale-down
+
+Scale-up needs no orchestration. The `computeMembers` filter excludes pods
+that aren't yet `PodReady`, so a newly-added pod simply doesn't appear in
+the ring until it can serve traffic. There's a window during which the
+pod exists but isn't yet a member; clients hash to existing pods only.
+Harmless: cache-miss-but-no-error.
+
+Scale-down is timing-critical. Without coordination, the StatefulSet
+would terminate pods at t=0s while clients still held the previous ring
+for up to one poll interval (10s). During that window, traffic targets
+dying pods and clients see connection errors instead of misses. Drain
+exists to invert this order: publish the new ring **before** terminating
+the pods, observe a grace period that exceeds the client poll interval
+(30s default; 3× the 10s poll), then proceed with termination.
+
+### Mechanism
+
+A pod is excluded from the ring as soon as it carries the annotation
+`cache.sk1.services.com/draining-since=<unix-ts>`. The annotation is the
+entire signal: `computeMembers` filters on it, and once filtered, the
+operator republishes the ring without that member. The pod is still
+running, still in the Service's endpoint list, still receiving traffic
+from clients on the old ring — but the published ring already reflects
+its absence. After clients converge (≤ poll interval), no traffic
+targets the pod even though it's still alive.
+
+The annotation is preferable to flipping a label that the Service selects
+on. Removing a pod from the Service's selector would cause the
+StatefulSet to immediately recreate the pod (a missing labeled pod is
+something the StatefulSet considers its responsibility to fix), creating
+a fight between the operator and the StatefulSet controller. Annotations
+don't participate in selectors and don't conflict.
+
+### Two trigger paths, one primitive
+
+Drain runs in two situations: scale-down (`spec.replicas` decreased) and
+deletion (`metadata.deletionTimestamp` set). Both flows share the same
+primitive — annotate the doomed pods, wait grace, proceed — implemented
+as two methods (`drainScaleDown` and `reconcileDeletion`) that consume
+the same `computeMembers` filter and emit the same `RingPublished`
+events.
+
+Scale-down doesn't actually delete any pods directly; it holds the
+StatefulSet at its current replica count until grace elapses, then
+allows the StatefulSet's normal scale-down logic to terminate the now-
+silent pods. Deletion goes further: after the wait, it removes the
+finalizer, allowing the CR to be GC'd along with all owned resources.
+
+This shared primitive also covers a third case automatically: image
+rolls. When the StatefulSet replaces a pod for an image update, the
+replaced pod's `DeletionTimestamp` is set, which the same
+`computeMembers` filter respects. The pod leaves the ring before it
+terminates without any image-roll-specific code.
+
+### Timing
+
+The default `drain.gracePeriodSeconds` is 30. The reasoning:
+
+  - Reference client poll interval: 10s (locked design).
+  - 30s = 3× poll interval, allowing 2 missed polls before drain
+    completes — defense against transient client GC pauses,
+    network blips, or controller scheduling delays.
+  - StatefulSet `terminationGracePeriodSeconds` is set to
+    `drain.gracePeriodSeconds + 10` so the kubelet's hard-kill
+    deadline is well after the operator-coordinated drain ends.
+    The +10 absorbs the cache pod's own graceful-shutdown deadline.
+
+Reconcile rate during drain is set by `RequeueAfter: 2*time.Second`
+because no event will wake the reconciler during the wait — pods aren't
+changing, ring isn't changing, spec isn't changing. The operator must
+schedule its own re-entry. 2s gives ~15 checks across a 30s grace
+window, more than enough to detect completion promptly without
+thrashing the API server.
+
+### What this contract gives clients
+
+A client that polls the ring every 10s and respects published membership
+strictly is guaranteed not to send traffic to a pod that's actively
+terminating, provided the operator's drain succeeded. A client that's
+slow, paused, or partitioned for >30s will eventually route to a missing
+pod and see connection-refused — but that case is no worse than what
+happens when any cache pod fails for any other reason, and is bounded
+by client-side retry behavior.
+
+The contract is strictly "no error during *coordinated* removal." It
+does not promise anything about pods that crash, are evicted, or are
+killed by node failures. Those flow through the same readiness signal
+(`/readyz` returning 503 → `PodReady=False` → ring exclusion) but with
+no grace window — clients see a brief window of errors before the next
+ring publish picks up the change. Acceptable because (a) those events
+are rare relative to scheduled drains, and (b) cache-is-a-hint
+semantics absorb transient errors.
+
