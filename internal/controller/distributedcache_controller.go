@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,12 +50,16 @@ const (
 // Condition reasons. Treat these as part of the API contract: monitoring and
 // alerting will key on these strings, so renames are breaking changes.
 const (
-	ReasonReconciled        = "Reconciled"
-	ReasonInitializing      = "Initializing"
-	ReasonNotRequested      = "NotRequested"
-	ReasonNotImplemented    = "NotImplemented"
-	ReasonServiceFailed     = "ServiceReconcileFailed"
-	ReasonStatefulSetFailed = "StatefulSetReconcileFailed"
+	ReasonReconciled           = "Reconciled"
+	ReasonNoReadyPods          = "NoReadyPods"
+	ReasonInsufficientReplicas = "InsufficientReplicas"
+	ReasonRingNotPublished     = "RingNotPublished"
+	ReasonReplicasConverging   = "ReplicasConverging"
+	ReasonNotRequested         = "NotRequested"
+	ReasonNotImplemented       = "NotImplemented"
+	ReasonServiceFailed        = "ServiceReconcileFailed"
+	ReasonStatefulSetFailed    = "StatefulSetReconcileFailed"
+	ReasonRingFailed           = "RingReconcileFailed"
 )
 
 // Standard recommended labels propagated to every owned resource.
@@ -85,6 +91,7 @@ type DistributedCacheReconciler struct {
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cache.sk1.services.com,resources=distributedcaches/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -92,9 +99,11 @@ type DistributedCacheReconciler struct {
 // Reconcile drives a DistributedCache toward its desired state. It is
 // level-triggered: every invocation re-observes the world from scratch and
 // makes one step's worth of progress, idempotently.
+// Reconcile drives a DistributedCache toward its desired state.
 func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// 1. Fetch the CR.
 	var cache cachev1alpha1.DistributedCache
 	if err := r.Get(ctx, req.NamespacedName, &cache); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -110,6 +119,9 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		"image", cache.Spec.Image,
 	)
 
+	// 2. Reconcile owned resources in dependency order: Service first
+	//    (StatefulSet's serviceName references it), then StatefulSet
+	//    (creates pods), then ring ConfigMap (depends on pod readiness).
 	if err := r.reconcileService(ctx, &cache); err != nil {
 		r.markDegraded(&cache, ReasonServiceFailed, err)
 		_ = r.Status().Update(ctx, &cache)
@@ -122,9 +134,27 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("reconcile statefulset: %w", err)
 	}
 
-	cache.Status.ObservedGeneration = cache.Generation
-	r.setInitializingConditions(&cache)
+	ring, err := r.reconcileRing(ctx, &cache)
+	if err != nil {
+		r.markDegraded(&cache, ReasonRingFailed, err)
+		_ = r.Status().Update(ctx, &cache)
+		return ctrl.Result{}, fmt.Errorf("reconcile ring: %w", err)
+	}
 
+	// 3. Mirror ring into status. Status is a summary view for humans;
+	//    the authoritative ring lives in the ConfigMap.
+	cache.Status.Ring = cachev1alpha1.RingStatus{
+		Version:       ring.Version,
+		Members:       ring.Members,
+		ConfigMapName: ringConfigMapName(&cache),
+	}
+	cache.Status.ReadyReplicas = int32(len(ring.Members))
+	cache.Status.ObservedGeneration = cache.Generation
+
+	// 4. Compute conditions from observed state.
+	r.setObservedConditions(&cache, ring)
+
+	// 5. Persist status.
 	if err := r.Status().Update(ctx, &cache); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
@@ -315,46 +345,216 @@ func (r *DistributedCacheReconciler) reconcileStatefulSet(ctx context.Context, c
 	return nil
 }
 
-// setInitializingConditions sets the four conditions to a coherent
-// "we observed the object but haven't finished bringing up the data plane"
-// state. As we add ring reconciliation, this helper will be replaced with
-// logic that reflects real readiness from the StatefulSet's status.
-func (r *DistributedCacheReconciler) setInitializingConditions(cache *cachev1alpha1.DistributedCache) {
-	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+// ringConfigMapName returns the name of the ConfigMap that holds the
+// authoritative ring for this cache. We append "-ring" to the CR name so
+// the ConfigMap is distinguishable from the cache's own resources (Service
+// and StatefulSet share the CR name); a quick `kubectl get cm` shows
+// at a glance which ConfigMaps are operator-managed.
+func ringConfigMapName(cache *cachev1alpha1.DistributedCache) string {
+	return cache.Name + "-ring"
+}
+
+const ringConfigMapKey = "ring.json"
+
+// reconcileRing computes the desired ring from current pod state, compares
+// against the existing ring ConfigMap, bumps the version on membership
+// change, and persists the result. Returns the ring that was published so
+// the caller can mirror it into status.
+//
+// The version is monotonic across reconciles: it comes from the existing
+// ConfigMap (the source of truth) and only ever increases. If the
+// ConfigMap is missing, version starts at 1 on the first publish.
+func (r *DistributedCacheReconciler) reconcileRing(ctx context.Context, cache *cachev1alpha1.DistributedCache) (Ring, error) {
+	log := logf.FromContext(ctx)
+
+	// Step 1: list owned pods.
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.InNamespace(cache.Namespace),
+		client.MatchingLabels(podLabels(cache)),
+	); err != nil {
+		return Ring{}, fmt.Errorf("list pods: %w", err)
+	}
+
+	// Step 2: compute desired membership from pod state.
+	desiredMembers := computeMembers(podList.Items)
+
+	// Step 3: read the existing ring ConfigMap. NotFound is the expected
+	// path on first reconcile; treat as an empty ring at version 0.
+	current := Ring{Version: 0, Members: nil}
+	var cm corev1.ConfigMap
+	cmKey := types.NamespacedName{Namespace: cache.Namespace, Name: ringConfigMapName(cache)}
+	if err := r.Get(ctx, cmKey, &cm); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return Ring{}, fmt.Errorf("get ring ConfigMap: %w", err)
+		}
+		// Not found: leave `current` as the zero ring.
+	} else {
+		// Found: parse the stored ring. A malformed ConfigMap is treated
+		// as version 0 — we'd rather rebuild than refuse to publish.
+		if data, ok := cm.Data[ringConfigMapKey]; ok {
+			var parsed Ring
+			if err := json.Unmarshal([]byte(data), &parsed); err == nil {
+				current = parsed
+			} else {
+				log.Info("ring ConfigMap had unparsable payload; rebuilding", "err", err)
+			}
+		}
+	}
+
+	// Step 4: decide the new version.
+	desired := Ring{Members: desiredMembers}
+	if desired.MembersEqual(current) {
+		desired.Version = current.Version
+	} else {
+		desired.Version = current.Version + 1
+	}
+
+	// Short-circuit: if the existing ConfigMap already encodes the desired
+	// ring exactly, skip the write entirely. This is the no-op reconcile
+	// path; with status-update events also triggering reconciles, this
+	// matters for keeping API server load bounded.
+	if desired.Equal(current) && len(cm.Data) > 0 {
+		log.V(1).Info("ring unchanged; skipping ConfigMap write",
+			"version", desired.Version, "members", len(desired.Members))
+		return desired, nil
+	}
+
+	// Step 5 + 6: marshal and write.
+	payload, err := json.Marshal(desired)
+	if err != nil {
+		return Ring{}, fmt.Errorf("marshal ring: %w", err)
+	}
+
+	cm = corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ringConfigMapName(cache),
+			Namespace: cache.Namespace,
+		},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, &cm, func() error {
+		if cm.Labels == nil {
+			cm.Labels = map[string]string{}
+		}
+		cm.Labels[labelName] = appName
+		cm.Labels[labelInstance] = cache.Name
+		cm.Labels[labelManagedBy] = managedByValue
+		cm.Labels[labelComponent] = "ring"
+
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[ringConfigMapKey] = string(payload)
+
+		return controllerutil.SetControllerReference(cache, &cm, r.Scheme)
+	})
+	if err != nil {
+		return Ring{}, fmt.Errorf("CreateOrUpdate ring ConfigMap: %w", err)
+	}
+
+	if op != controllerutil.OperationResultNone {
+		log.Info("published ring",
+			"operation", op,
+			"version", desired.Version,
+			"members", desired.Members,
+		)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "RingPublished",
+			"Ring %s/%s %s (version=%d, members=%v)",
+			cm.Namespace, cm.Name, op, desired.Version, desired.Members)
+	}
+
+	return desired, nil
+}
+
+// setObservedConditions writes the four conditions based on observed cluster
+// state. This replaces the earlier "Initializing" placeholder once the ring
+// is being computed; from this point onward, conditions reflect reality.
+//
+// The matrix:
+//
+//	Available=True only when ready replicas == desired and ring is published.
+//	Progressing=True when a transition is in flight (replica mismatch, or
+//	              generation hasn't been observed yet — though we always
+//	              update observedGeneration in the same write).
+//	Degraded=False on the happy path; callers set it directly via
+//	              markDegraded() in error paths and we don't clear it
+//	              from those reasons here.
+//	TenantIsolated reflects whether the user requested isolation.
+func (r *DistributedCacheReconciler) setObservedConditions(cache *cachev1alpha1.DistributedCache, ring Ring) {
+	desired := int32(0)
+	if cache.Spec.Replicas != nil {
+		desired = *cache.Spec.Replicas
+	}
+	ready := int32(len(ring.Members))
+	gen := cache.Generation
+
+	// Available: enough ready pods AND a published ring. Either alone
+	// is insufficient — pods Ready with no ring means clients can't
+	// route; ring published with too few pods means a real outage.
+	availableCond := metav1.Condition{
 		Type:               ConditionAvailable,
-		Status:             metav1.ConditionFalse,
-		Reason:             ReasonInitializing,
-		Message:            "Reconciler observed the resource; data plane not yet running.",
-		ObservedGeneration: cache.Generation,
-	})
-	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
+		ObservedGeneration: gen,
+	}
+	switch {
+	case ready == 0:
+		availableCond.Status = metav1.ConditionFalse
+		availableCond.Reason = ReasonNoReadyPods
+		availableCond.Message = "No cache pods are Ready."
+	case ready < desired:
+		availableCond.Status = metav1.ConditionFalse
+		availableCond.Reason = ReasonInsufficientReplicas
+		availableCond.Message = fmt.Sprintf("%d/%d replicas Ready.", ready, desired)
+	case ring.Version == 0:
+		availableCond.Status = metav1.ConditionFalse
+		availableCond.Reason = ReasonRingNotPublished
+		availableCond.Message = "Ring ConfigMap has not been published yet."
+	default:
+		availableCond.Status = metav1.ConditionTrue
+		availableCond.Reason = ReasonReconciled
+		availableCond.Message = fmt.Sprintf("%d/%d replicas Ready; ring version %d.", ready, desired, ring.Version)
+	}
+	meta.SetStatusCondition(&cache.Status.Conditions, availableCond)
+
+	// Progressing: True while we're transitioning toward spec.
+	progressingCond := metav1.Condition{
 		Type:               ConditionProgressing,
-		Status:             metav1.ConditionTrue,
-		Reason:             ReasonInitializing,
-		Message:            "Bringing up owned resources.",
-		ObservedGeneration: cache.Generation,
-	})
+		ObservedGeneration: gen,
+	}
+	if ready != desired {
+		progressingCond.Status = metav1.ConditionTrue
+		progressingCond.Reason = ReasonReplicasConverging
+		progressingCond.Message = fmt.Sprintf("Working toward %d replicas (currently %d Ready).", desired, ready)
+	} else {
+		progressingCond.Status = metav1.ConditionFalse
+		progressingCond.Reason = ReasonReconciled
+		progressingCond.Message = "Steady state."
+	}
+	meta.SetStatusCondition(&cache.Status.Conditions, progressingCond)
+
+	// Degraded: clear it on the happy path (we got here without errors).
+	// Error paths set it via markDegraded() before returning.
 	meta.SetStatusCondition(&cache.Status.Conditions, metav1.Condition{
 		Type:               ConditionDegraded,
 		Status:             metav1.ConditionFalse,
 		Reason:             ReasonReconciled,
 		Message:            "No degraded conditions observed.",
-		ObservedGeneration: cache.Generation,
+		ObservedGeneration: gen,
 	})
 
-	tenantStatus := metav1.Condition{
+	// TenantIsolated: same logic as before, no change.
+	tenantCond := metav1.Condition{
 		Type:               ConditionTenantIsolated,
 		Status:             metav1.ConditionFalse,
-		ObservedGeneration: cache.Generation,
+		ObservedGeneration: gen,
 	}
 	if cache.Spec.Tenant != nil && cache.Spec.Tenant.Isolate {
-		tenantStatus.Reason = ReasonNotImplemented
-		tenantStatus.Message = "Tenant isolation accepted by API but not yet wired."
+		tenantCond.Reason = ReasonNotImplemented
+		tenantCond.Message = "Tenant isolation accepted by API but not yet wired."
 	} else {
-		tenantStatus.Reason = ReasonNotRequested
-		tenantStatus.Message = "spec.tenant.isolate is unset or false."
+		tenantCond.Reason = ReasonNotRequested
+		tenantCond.Message = "spec.tenant.isolate is unset or false."
 	}
-	meta.SetStatusCondition(&cache.Status.Conditions, tenantStatus)
+	meta.SetStatusCondition(&cache.Status.Conditions, tenantCond)
 }
 
 // SetupWithManager wires the reconciler into the manager. The Owns calls

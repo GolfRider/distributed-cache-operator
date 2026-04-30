@@ -186,3 +186,26 @@ failure mode must surface in `kubectl describe` with a stable reason that
 monitoring can match on. Log lines are for operators of the operator;
 conditions are for users of the CR.
 
+
+---
+
+## 3. Known operational wart: stuck StatefulSet rollouts
+
+A StatefulSet that has never had any Ready pod cannot complete a
+RollingUpdate. The default update strategy waits for each pod to become
+Ready before terminating the next one for replacement; if the pods are
+crash-looping (e.g. an `ImagePullBackOff` left over from a misconfigured
+image), the rollout never advances. The operator has correctly updated the
+StatefulSet's pod template, but the StatefulSet refuses to act on it.
+
+The recovery is `kubectl delete pod -l <selector>`: removing the broken
+pods lets the StatefulSet create fresh ones from the current template.
+This is a property of StatefulSet's update controller, not of this
+operator, and it applies to every operator built on StatefulSets. We
+considered adding a force-update path that deletes stuck pods automatically
+once a Degraded condition has persisted past a threshold, but rejected it
+for v1alpha1: the heuristic is hard to get right (when is "stuck" really
+stuck vs. recovering?), the failure mode is rare in healthy environments,
+and the manual recovery is one command. Documented here so an operator
+running this for the first time recognizes the symptom.
+
