@@ -92,6 +92,11 @@ func computeMembers(pods []corev1.Pod) []string {
 		if !p.DeletionTimestamp.IsZero() {
 			continue
 		}
+		// NEW: pods being drained are excluded from the ring as soon as
+		// the drain annotation appears, even before they go NotReady.
+		if _, draining := p.Annotations[drainAnnotation]; draining {
+			continue
+		}
 		if p.Status.Phase != corev1.PodRunning {
 			continue
 		}

@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +39,15 @@ import (
 
 	cachev1alpha1 "github.com/GolfRider/distributed-cache-operator/api/v1alpha1"
 )
+
+// Finalizer name added to every DistributedCache. Must be removed before
+// the API server completes deletion; gives us a chance to drain pods.
+const drainFinalizer = "cache.sk1.services.com/drain"
+
+// Annotation set on a pod when drain begins. Value is a Unix-second
+// timestamp. computeMembers excludes annotated pods immediately;
+// the timestamp lets subsequent reconciles know when grace expires.
+const drainAnnotation = "cache.sk1.services.com/draining-since"
 
 // Condition types reported by the DistributedCache reconciler.
 // Exported so tests, clients, and humans can reference the same constants.
@@ -103,7 +114,6 @@ type DistributedCacheReconciler struct {
 func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// 1. Fetch the CR.
 	var cache cachev1alpha1.DistributedCache
 	if err := r.Get(ctx, req.NamespacedName, &cache); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -116,19 +126,44 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	log.Info("reconciling",
 		"generation", cache.Generation,
 		"replicas", cache.Spec.Replicas,
-		"image", cache.Spec.Image,
+		"deleting", !cache.DeletionTimestamp.IsZero(),
 	)
 
-	// 2. Reconcile owned resources in dependency order: Service first
-	//    (StatefulSet's serviceName references it), then StatefulSet
-	//    (creates pods), then ring ConfigMap (depends on pod readiness).
+	// Handle deletion: drain all pods, then remove finalizer.
+	if !cache.DeletionTimestamp.IsZero() {
+		return r.reconcileDeletion(ctx, &cache)
+	}
+
+	// Ensure finalizer is present on every reconcile of a non-deleted CR.
+	// Idempotent — AddFinalizer returns false if already present.
+	if controllerutil.AddFinalizer(&cache, drainFinalizer) {
+		if err := r.Update(ctx, &cache); err != nil {
+			return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
+		}
+		// After Update, our local copy's resourceVersion is stale relative
+		// to the server. Return and let controller-runtime requeue with a
+		// fresh read — cleaner than continuing with a possibly-stale object.
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Reconcile owned resources.
 	if err := r.reconcileService(ctx, &cache); err != nil {
 		r.markDegraded(&cache, ReasonServiceFailed, err)
 		_ = r.Status().Update(ctx, &cache)
 		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
 
-	if err := r.reconcileStatefulSet(ctx, &cache); err != nil {
+	// Drain BEFORE reducing StatefulSet replicas. If spec.replicas dropped
+	// below current StatefulSet replicas, mark the doomed pods first and
+	// hold the StatefulSet at its current size until grace expires.
+	doomedComplete, err := r.drainScaleDown(ctx, &cache)
+	if err != nil {
+		r.markDegraded(&cache, ReasonStatefulSetFailed, err)
+		_ = r.Status().Update(ctx, &cache)
+		return ctrl.Result{}, fmt.Errorf("drain scale-down: %w", err)
+	}
+
+	if err := r.reconcileStatefulSet(ctx, &cache, doomedComplete); err != nil {
 		r.markDegraded(&cache, ReasonStatefulSetFailed, err)
 		_ = r.Status().Update(ctx, &cache)
 		return ctrl.Result{}, fmt.Errorf("reconcile statefulset: %w", err)
@@ -141,8 +176,6 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("reconcile ring: %w", err)
 	}
 
-	// 3. Mirror ring into status. Status is a summary view for humans;
-	//    the authoritative ring lives in the ConfigMap.
 	cache.Status.Ring = cachev1alpha1.RingStatus{
 		Version:       ring.Version,
 		Members:       ring.Members,
@@ -150,15 +183,17 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 	cache.Status.ReadyReplicas = int32(len(ring.Members))
 	cache.Status.ObservedGeneration = cache.Generation
-
-	// 4. Compute conditions from observed state.
 	r.setObservedConditions(&cache, ring)
 
-	// 5. Persist status.
 	if err := r.Status().Update(ctx, &cache); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
 
+	// If we're mid-drain, requeue after a small delay so the timer advances
+	// without waiting for the next watch event.
+	if !doomedComplete {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -236,7 +271,7 @@ func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache
 // the right replicas, image, resources, and probes. Each pod gets a stable
 // DNS name (cache-0.<svc>, cache-1.<svc>, ...) which the consistent-hash
 // ring math depends on.
-func (r *DistributedCacheReconciler) reconcileStatefulSet(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+func (r *DistributedCacheReconciler) reconcileStatefulSet(ctx context.Context, cache *cachev1alpha1.DistributedCache, canScaleDown bool) error {
 	log := logf.FromContext(ctx)
 
 	sts := &appsv1.StatefulSet{
@@ -256,8 +291,13 @@ func (r *DistributedCacheReconciler) reconcileStatefulSet(ctx context.Context, c
 		sts.Labels[labelManagedBy] = managedByValue
 		sts.Labels[labelComponent] = "cache"
 
-		// Replicas, mutable.
-		sts.Spec.Replicas = cache.Spec.Replicas
+		// Replicas, mutable. During an in-progress scale-down drain, hold
+		// the StatefulSet at the larger size until canScaleDown becomes true.
+		desiredReplicas := cache.Spec.Replicas
+		if !canScaleDown && sts.Spec.Replicas != nil && *desiredReplicas < *sts.Spec.Replicas {
+			desiredReplicas = sts.Spec.Replicas
+		}
+		sts.Spec.Replicas = desiredReplicas
 
 		// Immutable fields: only set on creation. The API server rejects
 		// updates that change selector, serviceName, or volumeClaimTemplates,
@@ -555,6 +595,188 @@ func (r *DistributedCacheReconciler) setObservedConditions(cache *cachev1alpha1.
 		tenantCond.Message = "spec.tenant.isolate is unset or false."
 	}
 	meta.SetStatusCondition(&cache.Status.Conditions, tenantCond)
+}
+
+// drainScaleDown handles scale-down with grace. If spec.replicas is below
+// the current StatefulSet's replica count, this method:
+//
+//  1. Identifies which pods are doomed (those with ordinals >= spec.replicas).
+//  2. Annotates them with the drain timestamp if not already annotated.
+//  3. Returns canScaleDown=true once every doomed pod has been annotated
+//     for at least drain.gracePeriodSeconds.
+//
+// While canScaleDown=false, the caller (reconcileStatefulSet) holds the
+// StatefulSet at its current size, so the doomed pods stay alive but
+// excluded from the ring (computeMembers respects the annotation).
+//
+// Returns (canScaleDown, error). canScaleDown=true means the caller may
+// proceed to update the StatefulSet's replica count.
+func (r *DistributedCacheReconciler) drainScaleDown(
+	ctx context.Context,
+	cache *cachev1alpha1.DistributedCache,
+) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	// Look at the current StatefulSet to determine how many pods exist now.
+	var sts appsv1.StatefulSet
+	stsKey := types.NamespacedName{Namespace: cache.Namespace, Name: cache.Name}
+	if err := r.Get(ctx, stsKey, &sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			// First reconcile: nothing to drain.
+			return true, nil
+		}
+		return false, fmt.Errorf("get StatefulSet: %w", err)
+	}
+
+	currentReplicas := int32(0)
+	if sts.Spec.Replicas != nil {
+		currentReplicas = *sts.Spec.Replicas
+	}
+	desiredReplicas := int32(0)
+	if cache.Spec.Replicas != nil {
+		desiredReplicas = *cache.Spec.Replicas
+	}
+
+	if desiredReplicas >= currentReplicas {
+		// No scale-down in flight.
+		return true, nil
+	}
+
+	// Doomed pods are ordinals [desiredReplicas, currentReplicas).
+	doomedNames := make(map[string]bool, currentReplicas-desiredReplicas)
+	for i := desiredReplicas; i < currentReplicas; i++ {
+		doomedNames[fmt.Sprintf("%s-%d", cache.Name, i)] = true
+	}
+
+	// List pods owned by this CR.
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.InNamespace(cache.Namespace),
+		client.MatchingLabels(podLabels(cache)),
+	); err != nil {
+		return false, fmt.Errorf("list pods: %w", err)
+	}
+
+	grace := time.Duration(cache.Spec.Drain.GracePeriodSeconds) * time.Second
+	now := time.Now()
+	allReady := true
+
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if !doomedNames[p.Name] {
+			continue
+		}
+
+		// Annotate if not already.
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		if _, has := p.Annotations[drainAnnotation]; !has {
+			p.Annotations[drainAnnotation] = strconv.FormatInt(now.Unix(), 10)
+			if err := r.Update(ctx, p); err != nil {
+				return false, fmt.Errorf("annotate pod %s: %w", p.Name, err)
+			}
+			log.Info("marked pod for drain", "pod", p.Name)
+			r.Recorder.Eventf(cache, corev1.EventTypeNormal, "DrainStarted",
+				"Pod %s marked for drain (grace=%s)", p.Name, grace)
+			allReady = false
+			continue
+		}
+
+		// Already annotated. Has grace period elapsed?
+		ts, err := strconv.ParseInt(p.Annotations[drainAnnotation], 10, 64)
+		if err != nil {
+			// Bad annotation; rewrite as if first time.
+			p.Annotations[drainAnnotation] = strconv.FormatInt(now.Unix(), 10)
+			if err := r.Update(ctx, p); err != nil {
+				return false, fmt.Errorf("rewrite drain annotation on %s: %w", p.Name, err)
+			}
+			allReady = false
+			continue
+		}
+		drainStart := time.Unix(ts, 0)
+		if now.Sub(drainStart) < grace {
+			allReady = false
+		}
+	}
+
+	return allReady, nil
+}
+
+// reconcileDeletion is invoked when the CR has a non-zero DeletionTimestamp.
+// It drains all pods (annotating them so they leave the ring), waits for
+// drain.gracePeriodSeconds, then removes the finalizer. Owner references
+// take care of GC for the StatefulSet, Service, and ring ConfigMap.
+func (r *DistributedCacheReconciler) reconcileDeletion(
+	ctx context.Context,
+	cache *cachev1alpha1.DistributedCache,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(cache, drainFinalizer) {
+		// Finalizer already removed; nothing to do, GC will proceed.
+		return ctrl.Result{}, nil
+	}
+
+	// List all pods owned by this CR.
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.InNamespace(cache.Namespace),
+		client.MatchingLabels(podLabels(cache)),
+	); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list pods for deletion drain: %w", err)
+	}
+
+	grace := time.Duration(cache.Spec.Drain.GracePeriodSeconds) * time.Second
+	now := time.Now()
+	allDrained := true
+
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		if _, has := p.Annotations[drainAnnotation]; !has {
+			p.Annotations[drainAnnotation] = strconv.FormatInt(now.Unix(), 10)
+			if err := r.Update(ctx, p); err != nil {
+				return ctrl.Result{}, fmt.Errorf("annotate %s: %w", p.Name, err)
+			}
+			log.Info("deletion drain: annotated pod", "pod", p.Name)
+			allDrained = false
+			continue
+		}
+		ts, err := strconv.ParseInt(p.Annotations[drainAnnotation], 10, 64)
+		if err != nil {
+			allDrained = false
+			continue
+		}
+		if now.Sub(time.Unix(ts, 0)) < grace {
+			allDrained = false
+		}
+	}
+
+	// Republish the ring (excluding all annotated pods, which is all of them
+	// at this point). The ConfigMap will reflect "no members" and clients
+	// will see the cache as empty.
+	if _, err := r.reconcileRing(ctx, cache); err != nil {
+		log.Error(err, "publish ring during deletion (continuing)")
+	}
+
+	if !allDrained {
+		log.V(1).Info("waiting for drain to complete", "grace", grace)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Drain complete. Remove finalizer; GC will clean up everything else.
+	controllerutil.RemoveFinalizer(cache, drainFinalizer)
+	if err := r.Update(ctx, cache); err != nil {
+		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
+	}
+	r.Recorder.Eventf(cache, corev1.EventTypeNormal, "DrainComplete",
+		"All pods drained; finalizer removed.")
+	log.Info("deletion drain complete; finalizer removed")
+
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager wires the reconciler into the manager. The Owns calls
