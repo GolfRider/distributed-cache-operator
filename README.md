@@ -2,7 +2,7 @@
 
 A Kubernetes operator that manages sharded, in-memory cache clusters with
 client-side consistent hashing. The operator is the source of truth for ring
-topology and coordinates graceful scale events.
+topology and coordinates graceful scale-down and deletion.
 
 ---
 
