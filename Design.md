@@ -209,3 +209,73 @@ stuck vs. recovering?), the failure mode is rare in healthy environments,
 and the manual recovery is one command. Documented here so an operator
 running this for the first time recognizes the symptom.
 
+
+---
+
+## 4. The ring: authority, propagation, staleness
+
+Ring topology is owned by the operator and published as a ConfigMap that
+clients poll. The operator computes membership by listing pods owned by the
+CR, filtering to those that are `PodRunning` with `PodReady=True` and have
+no deletion timestamp, sorting by StatefulSet ordinal, and writing the
+result as JSON to `<cr-name>-ring`. The ConfigMap is the source of truth
+clients consume; the CR's `status.ring` mirrors it for human inspection
+via `kubectl describe`.
+
+### Versioning
+
+Each ring carries a monotonically increasing `version`. The version comes
+from the existing ConfigMap (read at the start of every reconcile), not
+from CR generation: pod readiness changes do not bump CR generation, so
+generation would lag membership changes. The bump rule is simple — if
+desired members differ from the current members in the ConfigMap, the new
+version is `current + 1`; otherwise the version is preserved and the write
+is skipped entirely.
+
+This monotonicity is preserved across reconciles, controller restarts, and
+optimistic-concurrency conflicts on the ConfigMap (the `resourceVersion`
+CAS guarantees only one writer wins per round; the loser re-reads and
+re-derives, never producing a regression).
+
+The one case where the version can regress is a corrupt or hand-edited
+ConfigMap whose JSON fails to parse. The reconciler treats this as
+"rebuild from scratch" rather than "refuse to publish": it is strictly
+better for the system to heal than to wedge. A production-grade design
+would surface the corruption as a `RingPayloadCorrupt` Degraded condition;
+we have not done so to keep v1alpha1 narrow.
+
+### Why ConfigMap and not status
+
+Status is a summary view for humans and CI; it is not designed for the
+high-frequency machine reads a sharded cache fleet generates. ConfigMap is
+purpose-built for "small structured data clients consume" — it has its own
+RBAC envelope, can be mounted as a volume for zero-API-server-load polling,
+and its updates produce watch events that are independent of CR events.
+Splitting the ring into a dedicated ConfigMap also means a future read-only
+client component can be granted RBAC for one ConfigMap rather than the
+entire CR including status.
+
+### Propagation: polling, not watching
+
+Clients poll the ConfigMap on a fixed interval (10s in our reference
+client). Watching it would be more efficient for change detection, but
+polling has two advantages for this design: it is simpler to implement
+correctly, and the staleness window it produces (≤ poll interval) becomes
+a *known constant* the drain logic can reason about. The operator's
+`drain.gracePeriodSeconds` defaults to 30s — three times the poll interval
+— precisely so that a pod marked NotReady has time to be observed as
+removed by every client before termination. Watching would tighten the
+window but eliminate the predictability that makes drain timing safe to
+reason about.
+
+### Pod watch is intentionally not registered
+
+`SetupWithManager` registers `Owns(&Service{})` and `Owns(&StatefulSet{})`
+but does not watch Pods directly. Pod readiness changes propagate to the
+reconciler indirectly: the StatefulSet's status updates when a pod becomes
+Ready, our `Owns(&StatefulSet{})` watch fires, and the parent CR is
+reconciled. Sub-second latency in practice. The alternative — watching
+Pods directly via `Watches(...)` with a custom mapper — is more code and
+more watch budget for a marginal latency improvement. Documented as
+intentional rather than missing.
+
