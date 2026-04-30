@@ -133,6 +133,34 @@ docker-build-tiny-cache: ## Build the tiny-cache image.
 kind-load-tiny-cache: docker-build-tiny-cache ## Build and load tiny-cache into kind.
 	kind load docker-image tiny-cache:dev --name dcache-dev
 
+##@ Cache CLI (reference client demo)
+
+.PHONY: docker-build-cache-cli
+docker-build-cache-cli: ## Build the cache-cli image.
+	$(CONTAINER_TOOL) build -t cache-cli:dev -f Dockerfile.cache-cli .
+
+.PHONY: kind-load-cache-cli
+kind-load-cache-cli: docker-build-cache-cli ## Build and load cache-cli into kind.
+	kind load docker-image cache-cli:dev --name dcache-dev
+
+##@ Kind cluster lifecycle
+
+KIND_CLUSTER ?= dcache-dev
+
+.PHONY: kind-up
+kind-up: ## Create kind cluster, install CRD, build & load tiny-cache image.
+	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || kind create cluster --name $(KIND_CLUSTER)
+	$(MAKE) install
+	$(MAKE) kind-load-tiny-cache
+	$(MAKE) kind-load-cache-cli
+	@echo
+	@echo "kind cluster '$(KIND_CLUSTER)' is up; CRD installed; images loaded."
+	@echo "Next: 'make run' in one terminal, then 'kubectl apply -f config/samples/'"
+
+.PHONY: kind-down
+kind-down: ## Destroy the kind cluster.
+	kind delete cluster --name $(KIND_CLUSTER)
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/

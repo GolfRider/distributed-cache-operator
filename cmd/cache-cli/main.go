@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -54,13 +55,9 @@ func main() {
 	}
 	op := flag.Arg(0)
 
-	if *kubeconfig == "" {
-		home, _ := os.UserHomeDir()
-		*kubeconfig = home + "/.kube/config"
-	}
-	cfg, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	cfg, err := loadRestConfig(*kubeconfig)
 	if err != nil {
-		fatalf("kubeconfig: %v", err)
+		fatalf("kube config: %v", err)
 	}
 
 	scheme := runtime.NewScheme()
@@ -156,4 +153,30 @@ func main() {
 func fatalf(f string, args ...any) {
 	fmt.Fprintf(os.Stderr, f+"\n", args...)
 	os.Exit(2)
+}
+
+// loadRestConfig returns a Kubernetes REST config, preferring in-cluster
+// service account credentials when available and falling back to a
+// kubeconfig file when running outside a cluster.
+func loadRestConfig(kubeconfigPath string) (*rest.Config, error) {
+	// In-cluster: kubelet mounts /var/run/secrets/kubernetes.io/serviceaccount/
+	// and sets KUBERNETES_SERVICE_HOST. rest.InClusterConfig succeeds when both
+	// are present.
+	if cfg, err := rest.InClusterConfig(); err == nil {
+		return cfg, nil
+	}
+
+	// Out-of-cluster: use the supplied path or default to ~/.kube/config.
+	if kubeconfigPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("home dir: %w", err)
+		}
+		kubeconfigPath = home + "/.kube/config"
+	}
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("kubeconfig %s: %w", kubeconfigPath, err)
+	}
+	return cfg, nil
 }

@@ -1,0 +1,19 @@
+# Dockerfile.cache-cli
+# Demo CLI for distributed-cache-operator. Run as a Kubernetes Job inside
+# the cluster (the cache pod FQDNs only resolve in-cluster).
+
+FROM golang:1.26-alpine AS builder
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/cache-cli/ cmd/cache-cli/
+COPY internal/cacheclient/ internal/cacheclient/
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /out/cache-cli ./cmd/cache-cli
+
+FROM scratch
+COPY --from=builder /out/cache-cli /cache-cli
+USER 65532:65532
+ENTRYPOINT ["/cache-cli"]
