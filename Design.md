@@ -383,3 +383,164 @@ ring publish picks up the change. Acceptable because (a) those events
 are rare relative to scheduled drains, and (b) cache-is-a-hint
 semantics absorb transient errors.
 
+
+---
+
+## 6. Cellular tenant isolation
+
+When `tenant.isolate: true`, each `DistributedCache` becomes a self-
+contained cell — a dedicated namespace with resource and network
+isolation enforced by Kubernetes-native primitives. 
+
+This is the project's take on the **cell primitive** pattern in multi-tenant infrastructure: each tenant's compute is an **independent** unit, and the **operator** is what manifests that unit on demand.
+
+### Why a separate namespace per cell
+
+Two designs were considered and rejected before settling on a dedicated
+cell namespace:
+
+  - **Same-namespace isolation** (just add `ResourceQuota` and
+    `NetworkPolicy` to the user's namespace): rejected because
+    `ResourceQuota` is per-namespace, not per-workload. Two
+    `DistributedCache` CRs in the same namespace would share a quota,
+    making per-cache isolation impossible without a namespace boundary.
+
+  - **User-managed cell namespace** (require the user to create the
+    namespace first, then apply the CR there): rejected because it
+    adds choreography to a control-plane abstraction that should be
+    declarative. The user expresses intent ("isolate this cache");
+    the operator manifests the isolation.
+
+The chosen design — operator-managed cell namespace named
+`cache-<cr-name>` — preserves the declarative model. The user creates
+a CR anywhere; the operator provisions a cell namespace and places the data plane resources inside it.
+
+### The cross-namespace ownership constraint
+
+Kubernetes' garbage collector follows `ownerReferences` only within a
+single namespace; cross-namespace references are rejected by the API
+server at write time. Since the CR lives in the user's namespace and
+the cell resources live in `cache-<cr-name>`, the operator cannot rely
+on owner-driven GC for cleanup. Two consequences in the code:
+
+  - Inside the cell namespace's reconcile paths (`reconcileService`,
+    `reconcileStatefulSet`, `reconcileRing`), the `SetControllerReference`
+    call is wrapped in a guard (`setControllerReferenceIfSameNamespace`)
+    that no-ops when the child is cross-namespace. The function name
+    documents intent: same-namespace children get owner-driven GC;
+    cross-namespace children get explicit cleanup.
+
+  - The CR's drain finalizer is responsible for tearing down the cell.
+    On CR deletion, after the drain grace period elapses, the operator
+    deletes the cell namespace. Kubernetes' namespace-deletion cascade
+    then GCs every contained resource — Service, StatefulSet, pods,
+    ConfigMap, ResourceQuota, NetworkPolicy — in one operation. The
+    finalizer is held until the namespace is fully gone, preventing a
+    fast-recreate of the same CR from colliding with a still-terminating
+    namespace.
+
+### The two enforcement primitives
+
+A cell carries two guardrails, each enforced by a different layer of
+Kubernetes:
+
+  - **`ResourceQuota`** (admission-time enforcement). Caps the
+    cell namespace at `replicas × memoryPerPod` plus 25% headroom for
+    transient overshoot, and `replicas + 1` pods for rolling-update
+    overlap. The headroom matters: without it, a rolling update that
+    briefly runs replicas+1 pods would be rejected by the quota and
+    block the rollout.
+
+    A useful side effect: when memory limits are set on the quota,
+    Kubernetes requires *every* pod in the namespace to declare its
+    own `requests.memory` and `limits.memory`. Pods that omit them
+    are rejected at admission. This means even a rogue `kubectl run`
+    against the cell namespace cannot bypass the resource discipline —
+    the cellular contract is enforced by the API server itself, not
+    just by the operator.
+
+  - **`NetworkPolicy`** (data-path enforcement). Restricts ingress to
+    pods within the same namespace. A pod elsewhere in the cluster
+    cannot reach the cell's data plane unless explicitly allowed by
+    additional policy. Verified empirically: a probe pod in the user
+    namespace observes packet drops (timeout) when targeting cell pods,
+    while a probe inside the cell succeeds.
+
+    Egress is intentionally not restricted at v1alpha1. Cells need to
+    reach the API server, DNS, and any upstream the application talks
+    to; restricting egress would require a careful per-tenant allowlist
+    that's out of scope. A future revision could expose this as
+    `tenant.egress` policy.
+
+### CNI dependency: kindnet vs Calico
+
+`NetworkPolicy` is a Kubernetes API resource, but enforcement is the
+CNI plugin's responsibility. Kind's default CNI (`kindnet`) accepts
+NetworkPolicies but does not enforce them — the resources exist as
+declarative artifacts but traffic flows freely. This would silently
+defeat the cellular boundary in local development.
+
+To make kind's behavior match production, `make kind-up` installs
+Calico in place of kindnet (configured via `disableDefaultCNI: true`
+in `hack/kind-config.yaml`). Calico is one of the standard production
+CNIs and enforces NetworkPolicy correctly. The operator behaves
+identically against any compliant CNI; the choice of Calico is a
+local-development convenience, not a binding requirement.
+
+This is documented in the README's prerequisites section. Reviewers
+familiar with kind will recognize the pattern.
+
+### Cell namespace name as part of the API contract
+
+The cell namespace name is derived from a constant prefix and the CR
+name (`cache-<cr-name>`). This mapping is part of the operator's
+implicit contract with operators of operators: anyone reasoning about
+"which namespace does CR `orders-cache` live in?" relies on the
+prefix being stable across operator versions.
+
+Renaming the prefix in a future operator release would orphan all
+existing cell namespaces — the new code would look for
+`<new-prefix>-orders-cache` while the live data plane is in
+`<old-prefix>-orders-cache`. Even though the operator could be
+restarted with the new code, the existing CRs' children would
+continue to live under the old name with no automatic migration.
+
+Two implications:
+
+  - The prefix is treated as part of the v1alpha1 contract; changing
+    it is a breaking change requiring a v1alpha2 conversion path.
+
+  - The choice of `cache-` as the prefix is deliberate: short, clear,
+    matches the CRD's API group root (`cache.sk1.services.com`), and
+    distinct enough for operators of the cluster to filter on
+    (`kubectl get ns | grep '^cache-'`).
+
+A more robust alternative — deriving the namespace name from the CR's
+`metadata.uid` rather than its `metadata.name` — would be immune to
+rename events but sacrifices human readability. We chose readability;
+DESIGN.md is the place that documents the choice.
+
+### Non-goals within cellular
+
+  - **Cross-cell network policy.** Cells default-deny ingress from
+    outside; explicit allow rules between cells (e.g. cell A may talk
+    to cell B for some reason) are not modeled. Adding it would
+    require a CR-level policy field.
+
+  - **Per-tenant RBAC.** The operator does not create per-cell RBAC
+    bindings for application teams. Teams reach into cells using
+    cluster-wide credentials. A production deployment would add
+    `Role`/`RoleBinding` per cell to scope team access.
+
+  - **Namespace-scoped operator.** The operator runs cluster-scoped
+    and watches `DistributedCache` resources in any namespace. A
+    namespace-scoped variant — one operator per tenant namespace —
+    is possible but unnecessary for the cellular boundary, which is
+    enforced by the cell namespace itself rather than by operator
+    scoping.
+
+  - **Per-cell admission webhooks.** Validation of cell-internal
+    resource creation (e.g. preventing privileged containers) is
+    delegated to cluster-wide policies (Pod Security admission,
+    Kyverno, etc.) rather than implemented per cell.
+
