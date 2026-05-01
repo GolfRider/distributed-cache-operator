@@ -78,7 +78,7 @@ const cachePort int32 = 8080
 
 // Cellular design constants.
 const (
-	cellNamespacePrefix = "cell-cache-"
+	cellNamespacePrefix = "cache-"
 	drainFinalizer      = "cache.sk1.services.com/drain"
 	drainAnnotation     = "cache.sk1.services.com/draining-since"
 )
@@ -773,11 +773,14 @@ func (r *DistributedCacheReconciler) reconcileDeletion(
 		return ctrl.Result{}, nil
 	}
 
+	// Phase 1: drain pods. Same logic as before, scoped to targetNamespace.
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList,
 		client.InNamespace(targetNamespace(cache)),
 		client.MatchingLabels(podLabels(cache)),
 	); err != nil {
+		// If the cell namespace itself is missing (e.g. force-deleted),
+		// list returns no error but empty list — fine, skip the drain.
 		return ctrl.Result{}, fmt.Errorf("list pods for deletion drain: %w", err)
 	}
 
@@ -809,8 +812,11 @@ func (r *DistributedCacheReconciler) reconcileDeletion(
 		}
 	}
 
+	// Best-effort ring republish so clients see "no members" before
+	// teardown. May fail if the cell namespace is mid-termination — log
+	// and continue.
 	if _, err := r.reconcileRing(ctx, cache); err != nil {
-		log.Error(err, "publish ring during deletion (continuing)")
+		log.V(1).Info("ring republish during deletion (non-fatal)", "err", err)
 	}
 
 	if !allDrained {
@@ -818,15 +824,77 @@ func (r *DistributedCacheReconciler) reconcileDeletion(
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
+	// Phase 2: in cellular mode, delete the cell namespace.
+	// Owner references handle children when CR and children share a
+	// namespace; in cellular mode the children are cross-namespace and
+	// owner refs aren't set, so we must explicitly tear down the cell.
+	if isCrossNamespaceChild(cache) {
+		done, err := r.deleteCellNamespace(ctx, cache)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete cell namespace: %w", err)
+		}
+		if !done {
+			// Namespace exists and is terminating; come back shortly.
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+
+	// Phase 3: drain and cell teardown complete. Release the CR.
 	controllerutil.RemoveFinalizer(cache, drainFinalizer)
 	if err := r.Update(ctx, cache); err != nil {
 		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
 	}
 	r.Recorder.Eventf(cache, corev1.EventTypeNormal, "DrainComplete",
-		"All pods drained; finalizer removed.")
+		"All pods drained; cell torn down; finalizer removed.")
 	log.Info("deletion drain complete; finalizer removed")
 
 	return ctrl.Result{}, nil
+}
+
+// deleteCellNamespace ensures the cell namespace is torn down. Returns
+// (done bool, err error):
+//
+//   - done=true  → namespace is gone (or never existed); safe to release CR.
+//   - done=false → namespace exists; either we just issued the delete
+//     (it's terminating), or it's still terminating from a
+//     prior reconcile. Caller should requeue.
+//
+// Deleting a namespace cascades to every namespaced resource inside it —
+// StatefulSet, Service, ConfigMap, ResourceQuota, NetworkPolicy, Pods —
+// so this single operation tears down the entire cell.
+func (r *DistributedCacheReconciler) deleteCellNamespace(
+	ctx context.Context,
+	cache *cachev1alpha1.DistributedCache,
+) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	ns := &corev1.Namespace{}
+	nsName := targetNamespace(cache)
+	if err := r.Get(ctx, types.NamespacedName{Name: nsName}, ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Already gone (or never created). Done.
+			return true, nil
+		}
+		return false, fmt.Errorf("get cell namespace: %w", err)
+	}
+
+	if ns.DeletionTimestamp.IsZero() {
+		// Hasn't been deleted yet; issue the delete.
+		if err := r.Delete(ctx, ns); err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, fmt.Errorf("delete cell namespace: %w", err)
+		}
+		log.Info("issued cell namespace deletion", "namespace", nsName)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "CellTearingDown",
+			"Cell namespace %s deletion issued; cascading to children.", nsName)
+		return false, nil
+	}
+
+	// Already terminating; wait.
+	log.V(1).Info("cell namespace terminating", "namespace", nsName)
+	return false, nil
 }
 
 func (r *DistributedCacheReconciler) setObservedConditions(cache *cachev1alpha1.DistributedCache, ring Ring) {
