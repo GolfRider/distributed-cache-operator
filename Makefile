@@ -65,7 +65,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= distributed-cache-operator-test-e2e
+KIND_CLUSTER ?= dcache-dev
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -145,17 +145,24 @@ kind-load-cache-cli: docker-build-cache-cli ## Build and load cache-cli into kin
 
 ##@ Kind cluster lifecycle
 
-KIND_CLUSTER ?= dcache-dev
+
 
 .PHONY: kind-up
-kind-up: ## Create kind cluster, install CRD, build & load tiny-cache image.
-	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || kind create cluster --name $(KIND_CLUSTER)
+kind-up: ## Create kind cluster with Calico CNI, install CRD, build & load images.
+	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || \
+	@kind create cluster --name $(KIND_CLUSTER) --config hack/kind-config.yaml
+	@kubectl config use-context kind-$(KIND_CLUSTER) >/dev/null
+	@echo "Installing Calico for NetworkPolicy enforcement..."
+	@kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
+	@echo "Waiting for Calico pods to be Ready (up to 3 min)..."
+	@kubectl rollout status -n kube-system daemonset/calico-node --timeout=180s
+	@kubectl rollout status -n kube-system deployment/calico-kube-controllers --timeout=180s
 	$(MAKE) install
 	$(MAKE) kind-load-tiny-cache
 	$(MAKE) kind-load-cache-cli
 	@echo
-	@echo "kind cluster '$(KIND_CLUSTER)' is up; CRD installed; images loaded."
-	@echo "Next: 'make run' in one terminal, then 'kubectl apply -f config/samples/'"
+	@echo "kind cluster '$(KIND_CLUSTER)' is up; CRD installed; images loaded; NetworkPolicy enforced via Calico."
+	@echo "kubectl context: $$(kubectl config current-context)"
 
 .PHONY: kind-down
 kind-down: ## Destroy the kind cluster.
