@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,6 +39,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/GolfRider/distributed-cache-operator/api/v1alpha1"
+	networkingv1 "k8s.io/api/networking/v1"
 )
 
 // Condition types reported by the DistributedCache reconciler.
@@ -56,7 +58,7 @@ const (
 	ReasonRingNotPublished     = "RingNotPublished"
 	ReasonReplicasConverging   = "ReplicasConverging"
 	ReasonNotRequested         = "NotRequested"
-	ReasonNotImplemented       = "NotImplemented"
+	ReasonCellFailed           = "CellReconcileFailed"
 	ReasonServiceFailed        = "ServiceReconcileFailed"
 	ReasonStatefulSetFailed    = "StatefulSetReconcileFailed"
 	ReasonRingFailed           = "RingReconcileFailed"
@@ -76,7 +78,7 @@ const cachePort int32 = 8080
 
 // Cellular design constants.
 const (
-	cellNamespacePrefix = "cache-"
+	cellNamespacePrefix = "cell-cache-"
 	drainFinalizer      = "cache.sk1.services.com/drain"
 	drainAnnotation     = "cache.sk1.services.com/draining-since"
 )
@@ -113,6 +115,9 @@ type DistributedCacheReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -144,10 +149,20 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if err := r.reconcileService(ctx, &cache); err != nil {
-		r.markDegraded(&cache, ReasonServiceFailed, err)
+	// Cell creation must run before owned resources, since they live
+	// in the cell namespace.
+	if err := r.reconcileCell(ctx, &cache); err != nil {
+		r.markDegraded(&cache, ReasonCellFailed, err)
 		_ = r.Status().Update(ctx, &cache)
-		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
+		return ctrl.Result{}, fmt.Errorf("reconcile cell: %w", err)
+	}
+
+	if err := r.reconcileService(ctx, &cache); err != nil {
+		if err := r.reconcileService(ctx, &cache); err != nil {
+			r.markDegraded(&cache, ReasonServiceFailed, err)
+			_ = r.Status().Update(ctx, &cache)
+			return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
+		}
 	}
 
 	doomedComplete, err := r.drainScaleDown(ctx, &cache)
@@ -221,6 +236,209 @@ func podLabels(cache *cachev1alpha1.DistributedCache) map[string]string {
 		labelName:     appName,
 		labelInstance: cache.Name,
 	}
+}
+
+// reconcileCell ensures the cellular isolation primitives exist when
+// tenant.isolate is true. Creates the cell Namespace, ResourceQuota, and
+// NetworkPolicy. Idempotent; returns nil and skips when isolation is off.
+//
+// Order of operations matters: Namespace first (others live in it), then
+// quota and netpol in either order. We run them sequentially so a failure
+// surfaces with a precise reason.
+func (r *DistributedCacheReconciler) reconcileCell(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+	if cache.Spec.Tenant == nil || !cache.Spec.Tenant.Isolate {
+		return nil
+	}
+
+	if err := r.reconcileCellNamespace(ctx, cache); err != nil {
+		return fmt.Errorf("namespace: %w", err)
+	}
+	if err := r.reconcileResourceQuota(ctx, cache); err != nil {
+		return fmt.Errorf("resourcequota: %w", err)
+	}
+	if err := r.reconcileNetworkPolicy(ctx, cache); err != nil {
+		return fmt.Errorf("networkpolicy: %w", err)
+	}
+	return nil
+}
+
+// reconcileCellNamespace creates the cell namespace if missing. The
+// namespace is *not* owned by the CR (cluster-scoped resources can't have
+// namespaced owners); the operator's finalizer cleans it up explicitly on
+// CR deletion.
+//
+// Labels on the namespace identify it as operator-managed and link back
+// to the CR, which is how the finalizer finds it.
+func (r *DistributedCacheReconciler) reconcileCellNamespace(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+	log := logf.FromContext(ctx)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: targetNamespace(cache),
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, ns, func() error {
+		if ns.Labels == nil {
+			ns.Labels = map[string]string{}
+		}
+		ns.Labels[labelName] = appName
+		ns.Labels[labelInstance] = cache.Name
+		ns.Labels[labelManagedBy] = managedByValue
+		ns.Labels[labelComponent] = "cell"
+		// Cell-origin pointer: which CR (in which namespace) owns this cell.
+		// Used by the finalizer cleanup and by anyone trying to trace a
+		// cell back to its declaration.
+		ns.Labels["cache.sk1.services.com/cell-of"] = cache.Namespace + "." + cache.Name
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("CreateOrUpdate Namespace: %w", err)
+	}
+
+	if op != controllerutil.OperationResultNone {
+		log.Info("reconciled cell Namespace", "operation", op, "name", ns.Name)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "CellNamespaceReconciled",
+			"Cell Namespace %s %s", ns.Name, op)
+	}
+	return nil
+}
+
+// reconcileResourceQuota creates a ResourceQuota in the cell namespace,
+// sized from spec.replicas × spec.memoryPerPod plus 25% headroom for
+// transient overshoot during scale events. Bounds total pods to spec.replicas.
+//
+// Two-cache cells get fully independent quotas because they live in
+// different namespaces — that's the cellular guarantee.
+func (r *DistributedCacheReconciler) reconcileResourceQuota(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+	log := logf.FromContext(ctx)
+
+	replicas := int32(0)
+	if cache.Spec.Replicas != nil {
+		replicas = *cache.Spec.Replicas
+	}
+	totalMem := cache.Spec.MemoryPerPod.DeepCopy()
+	totalMem.Set(totalMem.Value() * int64(replicas))
+	// 25% headroom: Add(0.25 × totalMem). Quantity arithmetic doesn't
+	// support multiplication directly; computing as bytes and reconstructing.
+	headroom := totalMem.Value() / 4
+	totalWithHeadroom := totalMem.DeepCopy()
+	totalWithHeadroom.Set(totalMem.Value() + headroom)
+
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cell-quota",
+			Namespace: targetNamespace(cache),
+		},
+	}
+
+	// Cap total pods at the requested replica count plus a small
+	// allowance for rolling updates (StatefulSet may briefly run +1
+	// during a rolling pod replacement).
+	podCap := replicas + 1
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, quota, func() error {
+		if quota.Labels == nil {
+			quota.Labels = map[string]string{}
+		}
+		quota.Labels[labelName] = appName
+		quota.Labels[labelInstance] = cache.Name
+		quota.Labels[labelManagedBy] = managedByValue
+		quota.Labels[labelComponent] = "cell"
+
+		quota.Spec.Hard = corev1.ResourceList{
+			corev1.ResourcePods:           *resourceQuantity(int64(podCap)),
+			corev1.ResourceLimitsMemory:   totalWithHeadroom,
+			corev1.ResourceRequestsMemory: totalWithHeadroom,
+		}
+		// Cross-namespace child: skip ownerRef.
+		return r.setControllerReferenceIfSameNamespace(cache, quota)
+	})
+	if err != nil {
+		return fmt.Errorf("CreateOrUpdate ResourceQuota: %w", err)
+	}
+
+	if op != controllerutil.OperationResultNone {
+		log.Info("reconciled cell ResourceQuota",
+			"operation", op,
+			"namespace", quota.Namespace,
+			"pods", podCap,
+			"memory", totalWithHeadroom.String(),
+		)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "QuotaReconciled",
+			"ResourceQuota %s/%s %s (memory=%s)",
+			quota.Namespace, quota.Name, op, totalWithHeadroom.String())
+	}
+	return nil
+}
+
+// reconcileNetworkPolicy creates a NetworkPolicy that denies all ingress
+// to the cell namespace except from pods within the same namespace.
+// This is the network half of the cellular boundary.
+//
+// Egress is allowed by default; cells need to talk to the API server,
+// DNS, etc. Restricting egress would require additional rules for those
+// dependencies, which is out of scope for v1alpha1.
+//
+// Note: enforcement requires a CNI that honors NetworkPolicy. The Calico
+// installation in `make kind-up` provides this; the default kindnet CNI
+// does not enforce these policies (the resources are still created, just
+// not enforced). See DESIGN.md.
+func (r *DistributedCacheReconciler) reconcileNetworkPolicy(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
+	log := logf.FromContext(ctx)
+
+	netpol := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cell-isolation",
+			Namespace: targetNamespace(cache),
+		},
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, netpol, func() error {
+		if netpol.Labels == nil {
+			netpol.Labels = map[string]string{}
+		}
+		netpol.Labels[labelName] = appName
+		netpol.Labels[labelInstance] = cache.Name
+		netpol.Labels[labelManagedBy] = managedByValue
+		netpol.Labels[labelComponent] = "cell"
+
+		netpol.Spec = networkingv1.NetworkPolicySpec{
+			// Empty PodSelector matches all pods in the namespace.
+			PodSelector: metav1.LabelSelector{},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+			},
+			// Allow ingress only from pods in the same namespace.
+			// PodSelector with no matchLabels matches all pods in the
+			// referenced namespace (which is the policy's own namespace
+			// since no namespaceSelector is given).
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					PodSelector: &metav1.LabelSelector{},
+				}},
+			}},
+		}
+		return r.setControllerReferenceIfSameNamespace(cache, netpol)
+	})
+	if err != nil {
+		return fmt.Errorf("CreateOrUpdate NetworkPolicy: %w", err)
+	}
+
+	if op != controllerutil.OperationResultNone {
+		log.Info("reconciled cell NetworkPolicy",
+			"operation", op, "namespace", netpol.Namespace)
+		r.Recorder.Eventf(cache, corev1.EventTypeNormal, "NetworkPolicyReconciled",
+			"NetworkPolicy %s/%s %s", netpol.Namespace, netpol.Name, op)
+	}
+	return nil
+}
+
+// resourceQuantity is a small helper to build a *resource.Quantity from
+// an int64 count. Used for ResourceQuota fields that take counts.
+func resourceQuantity(n int64) *resource.Quantity {
+	q := resource.NewQuantity(n, resource.DecimalSI)
+	return q
 }
 
 func (r *DistributedCacheReconciler) reconcileService(ctx context.Context, cache *cachev1alpha1.DistributedCache) error {
@@ -668,13 +886,16 @@ func (r *DistributedCacheReconciler) setObservedConditions(cache *cachev1alpha1.
 
 	tenantCond := metav1.Condition{
 		Type:               ConditionTenantIsolated,
-		Status:             metav1.ConditionFalse,
 		ObservedGeneration: gen,
 	}
 	if cache.Spec.Tenant != nil && cache.Spec.Tenant.Isolate {
-		tenantCond.Reason = ReasonNotImplemented
-		tenantCond.Message = "Tenant isolation accepted by API but not yet wired."
+		// Reaching this point means reconcileCell ran without error;
+		// otherwise we'd have returned early with Degraded.
+		tenantCond.Status = metav1.ConditionTrue
+		tenantCond.Reason = ReasonReconciled
+		tenantCond.Message = fmt.Sprintf("Cell namespace %s with quota and NetworkPolicy active.", targetNamespace(cache))
 	} else {
+		tenantCond.Status = metav1.ConditionFalse
 		tenantCond.Reason = ReasonNotRequested
 		tenantCond.Message = "spec.tenant.isolate is unset or false."
 	}
