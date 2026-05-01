@@ -386,11 +386,57 @@ semantics absorb transient errors.
 
 ---
 
-## 6. Cellular tenant isolation
+## Cellular tenant isolation
 
-When `tenant.isolate: true`, each `DistributedCache` becomes a self-
-contained cell — a dedicated namespace with resource and network
-isolation enforced by Kubernetes-native primitives. 
+When a `DistributedCache` declares `tenant.isolate: true`, the operator
+manifests a self-contained cell — a dedicated namespace that wraps the
+data plane in two enforcement boundaries.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       KUBERNETES CLUSTER                                │
+│                                                                         │
+│  ┌──────────────────────────┐         ┌──────────────────────────────┐  │
+│  │ NS: operator-system      │         │ NS: team-payments (user ns)  │  │
+│  │ ┌──────────────────────┐ │         │ ┌──────────────────────────┐ │  │
+│  │ │ Operator Deployment  │◄┼─────────┤ │ DistributedCache         │ │  │
+│  │ └──────────┬───────────┘ │ watches │ │   "orders-cache"         │ │  │
+│  └────────────┼─────────────┘         │ │   tenant.isolate: true   │ │  │
+│               │                       │ └──────────────────────────┘ │  │
+│               │ provisions / manages  └──────────────────────────────┘  │
+│               ▼                                                         │
+│  ┌──────────────────────────┐         ┌──────────────────────────────┐  │
+│  │ NS: cache-orders-cache   │         │ NS: cache-users-cache        │  │
+│  │      (Cell A)            │         │      (Cell B)                │  │
+│  │                          │         │                              │  │
+│  │ ┌──────────────────────┐ │         │ ┌──────────────────────┐     │  │
+│  │ │ StatefulSet (Pods)   │ │         │ │ StatefulSet (Pods)   │     │  │
+│  │ ├──────────────────────┤ │         │ ├──────────────────────┤     │  │
+│  │ │ Service (Headless)   │ │         │ │ Service (Headless)   │     │  │
+│  │ ├──────────────────────┤ │         │ ├──────────────────────┤     │  │
+│  │ │ ConfigMap (Ring)     │ │         │ │ ConfigMap (Ring)     │     │  │
+│  │ ├──────────────────────┤ │         │ ├──────────────────────┤     │  │
+│  │ │ ResourceQuota        │ │         │ │ ResourceQuota        │     │  │
+│  │ │ NetworkPolicy        │ │         │ │ NetworkPolicy        │     │  │
+│  │ └──────────────────────┘ │         │ └──────────────────────┘     │  │
+│  └──────────────────────────┘         └──────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Three namespaces, three concerns: the operator runs in
+`operator-system`, the user declares intent in their own namespace, and
+each isolated cache occupies its own cell namespace. Cells are fully
+independent — separate quota, separate network policy.
+
+```yaml
+apiVersion: cache.sk1.services.com/v1alpha1
+kind: DistributedCache
+metadata:
+  name: orders-cache
+  namespace: team-payments
+spec:
+  ...
+```
 
 This is the project's take on the **cell primitive** pattern in multi-tenant infrastructure: each tenant's compute is an **independent** unit, and the **operator** is what manifests that unit on demand.
 
