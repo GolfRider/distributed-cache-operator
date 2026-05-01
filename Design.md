@@ -439,6 +439,27 @@ on owner-driven GC for cleanup. Two consequences in the code:
     fast-recreate of the same CR from colliding with a still-terminating
     namespace.
 
+### Watching cross-namespace children
+
+`controller-runtime`'s `Owns()` builder uses `ownerReferences` to map
+events on owned resources back to the parent CR for re-reconciliation.
+Since cell-namespace children have no `ownerReference` (cross-namespace
+references are forbidden), changes to them do not trigger reconciles
+through this path. The operator would observe a stale view of the cell
+data plane indefinitely, only re-reconciling when something else (a
+human edit, a controller restart, the cache resync interval) nudges
+the CR.
+
+The pragmatic remedy used here: cellular reconciles return
+`RequeueAfter: 10s`, which polls the cell namespace at a fixed interval.
+This is sufficient for any human-scale workflow — pod-readiness
+transitions are observed within ~10 seconds, and the ring ConfigMap is
+republished on the next reconcile. A more efficient alternative would
+be a custom watch on cell-namespace resources with a label-based mapper
+that resolves them back to the parent CR. We chose periodic requeue for
+code simplicity; the trade-off is a bounded delay in observing
+pod-readiness changes.
+
 ### The two enforcement primitives
 
 A cell carries two guardrails, each enforced by a different layer of
