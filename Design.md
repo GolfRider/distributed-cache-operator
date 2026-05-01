@@ -544,3 +544,120 @@ DESIGN.md is the place that documents the choice.
     delegated to cluster-wide policies (Pod Security admission,
     Kyverno, etc.) rather than implemented per cell.
 
+
+---
+
+## 7. Orphans, the no-rebalancing argument, and observability
+
+### Why no rebalancing on scale events
+
+Membership changes — scale-up, scale-down, pod restart — alter the consistent-hash
+ring's mapping of keys to pods. Some keys that previously hashed to pod A
+now hash to pod B. Pod A still holds those keys in its LRU; nothing reads
+them; eventually they expire by TTL or are evicted by LRU pressure. This is
+the *orphan* condition.
+
+Three options are theoretically available:
+
+  1. **Rebalance**: move orphaned keys from pod A to pod B on every
+     membership change.
+  2. **Republish only**: do nothing about orphans; let TTL and LRU clean
+     them up over time. (What this project does.)
+  3. **Drain on remove**: explicitly clear an exiting pod's keys before
+     removing it, forcing a refetch on the next access.
+
+Option 1 (rebalance) is what Cassandra, CockroachDB, and similar systems
+do — and they pay for it: each membership change triggers a substantial
+data movement event, often visible as latency tail or cluster-wide pressure.
+For a *durable* store this is justified because losing data is unacceptable.
+For a cache it is not. A cache by definition is a hint with a known-loss
+property; clients tolerate misses by design.
+
+Option 3 (drain on remove) sounds intermediate but turns out worse: the
+drain itself produces a thundering-herd of refetches against the origin,
+which is exactly the failure mode caches exist to prevent. A pod going
+away takes its keys with it; clients re-fetch on demand at the natural
+request rate.
+
+Option 2 (republish only) is correct for this design's contract:
+
+  - **Cache as hint**: clients tolerate cache misses; the cache cannot
+    be a source of truth.
+  - **TTL bounds staleness**: every entry expires within its configured
+    TTL regardless of ring transitions, so orphan accumulation is
+    self-limiting.
+  - **LRU bounds memory**: orphans count toward each pod's LRU budget;
+    once memory pressure mounts, they are evicted before live keys
+    (because live keys are still being accessed and refresh their LRU
+    position; orphans are not).
+  - **Pod churn bounds residence**: pods are eventually replaced by
+    image rolls or node lifecycle events, at which point any remaining
+    orphans evaporate with the pod.
+
+The design therefore explicitly accepts a transient-orphan condition as
+the price of avoiding a rebalance-on-scale storm. The contract is
+documented; the alternative would be a different system.
+
+### Observability
+
+The operator surfaces operational state through three layers, each with a
+distinct audience:
+
+  - **CR `status.conditions`** for human inspection (`kubectl describe`)
+    and for CI gating (`kubectl wait --for=condition=Available`).
+    Reasons are stable strings suitable for use as monitoring keys.
+
+  - **Kubernetes events** (`Recorder.Eventf`) for an audit trail of what
+    the operator did and when: `ServiceReconciled`, `StatefulSetReconciled`,
+    `RingPublished`, `DrainStarted`, `CellTearingDown`, `DrainComplete`.
+    Visible in `kubectl describe` and consumed by tools like Argo Events.
+
+  - **controller-runtime's default metrics**, exposed at the `/metrics`
+    endpoint of the manager. The relevant metrics for alerting:
+
+```promql
+# Reconcile failures, rate. Alert if non-zero for 5 minutes.
+sum by (controller) (
+  rate(controller_runtime_reconcile_errors_total{controller="distributedcache"}[5m])
+)
+
+# Reconcile duration, p99. Alert if > 5s consistently.
+histogram_quantile(0.99,
+  rate(controller_runtime_reconcile_time_seconds_bucket{controller="distributedcache"}[5m])
+)
+
+# A DistributedCache stuck Available=False. Alert if persistent.
+sum by (name, namespace) (
+  kube_customresource_distributedcache_status_conditions{type="Available",status="false"}
+) > 0
+
+# Drain in flight for too long (reconciler keeps requeueing).
+# Custom metric we'd add if drain duration mattered for SLOs.
+```
+
+The third query depends on `kube-state-metrics` exporting CR conditions,
+which is a configuration step rather than something the operator does
+itself. Documented as the recommended observability stack rather than
+shipped.
+
+### What's deliberately *not* observable
+
+The operator does not expose:
+
+  - **Per-key hit/miss rates.** That's the data plane's responsibility;
+    `tiny-cache` would need its own `/metrics` endpoint exposing LRU stats.
+    Out of scope for this control-plane project.
+
+  - **Ring transition counters.** Each ring publication produces a
+    Kubernetes event, which is the audit trail. A counter would be
+    redundant; a transition rate is computable from event timestamps.
+
+  - **Per-cell resource consumption history.** `kube-state-metrics` plus
+    `ResourceQuota` already export the live state; historical series live
+    in Prometheus, not in the operator.
+
+The pattern: the operator emits its own state via standard primitives
+(conditions, events, controller-runtime metrics) and lets the surrounding
+ecosystem aggregate. **An operator should not become a monitoring system
+for its data plane**; that's a layering violation.
+

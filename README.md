@@ -69,7 +69,8 @@ spec:
   drain:
     gracePeriodSeconds: 30
   tenant:
-    isolate: false
+    isolate: true   # places the cache in a dedicated cell namespace
+                    # with ResourceQuota and NetworkPolicy boundaries
 ```
 
 `kubectl get` output is configured via printer columns:
@@ -86,7 +87,7 @@ etc.) suitable for monitoring keys.
 
 ## 60-second getting started
 
-Requirements: Docker, kind, kubectl, Go 1.24+, kubebuilder.
+Requirements: Docker, kind, kubectl, Go 1.26+, kubebuilder.
 
 ```bash
 make kind-up             # create kind cluster, install CRD, build & load images
@@ -188,6 +189,88 @@ been drained for `drain.gracePeriodSeconds`. Then the finalizer is removed
 and Kubernetes garbage-collects the StatefulSet, Service, ring ConfigMap, and
 all pods.
 
+## Cellular tenant isolation
+
+When a `DistributedCache` declares `tenant.isolate: true`, the operator
+manifests a self-contained cell — a dedicated namespace that wraps the
+data plane in two enforcement boundaries.
+
+```yaml
+apiVersion: cache.sk1.services.com/v1alpha1
+kind: DistributedCache
+metadata:
+  name: orders-cache
+  namespace: team-payments
+spec:
+  replicas: 3
+  image: tiny-cache:dev
+  memoryPerPod: 128Mi
+  tenant:
+    isolate: true
+```
+
+Resulting topology:
+
+```
+team-payments/
+└── DistributedCache "orders-cache"   # the user's intent
+
+cache-orders-cache/                     # the cell, operator-managed
+├── ResourceQuota                     # 3 pods × 128Mi + 25% headroom
+├── NetworkPolicy                     # ingress: same-namespace only
+├── Service "orders-cache"
+├── StatefulSet "orders-cache"
+├── Pods orders-cache-0,1,2
+└── ConfigMap "orders-cache-ring"
+```
+
+The cell namespace name is derived from the CR name: `cache-<cr-name>`.
+The CR itself stays in the user's namespace; the data plane and
+isolation guardrails live in the cell. When the CR is deleted, the
+operator's finalizer deletes the cell namespace, which cascade-deletes
+every contained resource in one operation.
+
+### What the boundaries enforce
+
+`ResourceQuota` caps total memory at `replicas × memoryPerPod` plus
+25% headroom for rolling-update overlap, and pod count at `replicas + 1`.
+A useful side effect: when the quota sets memory limits, Kubernetes
+requires every pod in the namespace to declare its own resource
+specs. Even a manual `kubectl run` against the cell namespace is
+rejected at admission unless it specifies memory. The cellular
+contract is enforced by the API server itself, not just by the
+operator.
+
+`NetworkPolicy` defaults to deny-all ingress except from pods within
+the same namespace. A pod elsewhere in the cluster cannot reach the
+cell's data plane.
+
+### CNI requirement
+
+`NetworkPolicy` enforcement is the CNI plugin's responsibility, not
+the API server's. Kind's default CNI (`kindnet`) accepts the policy
+resource but does not enforce it; traffic flows freely. The
+`make kind-up` target installs Calico (a standard production CNI
+that does enforce NetworkPolicy) so the cellular boundary is real
+locally as well as in production. See `hack/kind-config.yaml` and
+DESIGN.md §6 for the rationale.
+
+### Multiple cells, side by side
+
+Multiple `DistributedCache` CRs with `tenant.isolate: true` produce
+fully independent cells. Each gets its own namespace, its own quota,
+its own NetworkPolicy. Resource exhaustion in one cell cannot starve
+another; a compromised pod in one cell cannot reach another's data.
+
+```
+cache-orders-cache/    cache-users-cache/    cache-sessions-cache/
+└── independent       └── independent        └── independent
+```
+
+This is the practical realization of the cell primitive: a unit of
+compute with its own resource and network envelope, manageable as a
+single Kubernetes-native abstraction.
+
 ## Non-goals
 
 Explicitly out of scope for v1alpha1, with one-line redirects:
@@ -203,8 +286,7 @@ Explicitly out of scope for v1alpha1, with one-line redirects:
   shard ownership semantics (Cassandra, CockroachDB).
 - **Out-of-cluster clients** — pod FQDNs only resolve in-cluster. An external
   proxy could be added but is intentionally not part of this surface.
-- **Admission webhooks** — CRD validation markers are sufficient for the
-  invariants we care about.
+- **Custom admission webhooks** — we don't ship our own ValidatingAdmissionWebhook for the CR; CRD +kubebuilder:validation: markers cover the input invariants we care about. Cell-namespace pod admission is enforced by the cluster's standard ResourceQuota and NetworkPolicy admission paths.
 - **HPA / KEDA integration** — a layered concern; a future controller could
   watch ring metrics and edit `spec.replicas`.
 - **CRD version conversion** — only `v1alpha1` is shipped; we do not commit
@@ -232,6 +314,8 @@ config/
   crd/bases/                 generated CRD YAML
   rbac/                      generated RBAC YAML
   samples/                   example CRs and Jobs
+hack/
+  kind-config.yaml           kind cluster config (Calico + disable kindnet) 
 Dockerfile                   operator image
 Dockerfile.tiny-cache        tiny-cache image
 Dockerfile.cache-cli         cache-cli image
