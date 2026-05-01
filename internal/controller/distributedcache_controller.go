@@ -201,6 +201,12 @@ func (r *DistributedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if !doomedComplete {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
+	// In cellular mode, owned resources live in a different namespace and
+	// cannot be watched via Owns(). Periodic requeue ensures the operator
+	// observes pod readiness changes and re-publishes the ring.
+	if isCrossNamespaceChild(&cache) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
