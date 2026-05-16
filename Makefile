@@ -8,14 +8,8 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-# CONTAINER_TOOL defines the container tool to be used for building images.
-# Be aware that the target commands are only tested with Docker which is
-# scaffolded by default. However, you might want to replace it to use other
-# tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
 
-# Setting SHELL to bash allows bash commands to be executed by recipes.
-# Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
@@ -23,17 +17,6 @@ SHELL = /usr/bin/env bash -o pipefail
 all: build
 
 ##@ General
-
-# The help target prints out all targets with their descriptions organized
-# beneath their categories. The categories are represented by '##@' and the
-# target descriptions by '##'. The awk command is responsible for reading the
-# entire set of makefiles included in this invocation, looking for lines of the
-# file as xyz: ## something, and then pretty-format the target and help. Then,
-# if there's a line with ##@ something, that gets pretty-printed as a category.
-# More info on the usage of ANSI control characters for terminal formatting:
-# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
-# More info on the awk command:
-# http://linuxcommand.org/lc3_adv_awk.php
 
 .PHONY: help
 help: ## Display this help.
@@ -61,11 +44,7 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= dcache-dev
+KIND_CLUSTER ?= global-workload-orchestrator-test-e2e
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -80,6 +59,11 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
+
+.PHONY: test-e2e
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests.
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
@@ -101,15 +85,12 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/manager/main.go
+	go build -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/manager/main.go
+	go run ./cmd/main.go
 
-# If you wish to build the manager image targeting other platforms you can use the --platform flag.
-# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
-# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
@@ -118,66 +99,14 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
-##@ Tiny-cache (data plane)
-
-.PHONY: docker-build-tiny-cache
-docker-build-tiny-cache: ## Build the tiny-cache image.
-	$(CONTAINER_TOOL) build -t tiny-cache:dev -f Dockerfile.tiny-cache .
-
-.PHONY: kind-load-tiny-cache
-kind-load-tiny-cache: docker-build-tiny-cache ## Build and load tiny-cache into kind.
-	kind load docker-image tiny-cache:dev --name dcache-dev
-
-##@ Cache CLI (reference client demo)
-
-.PHONY: docker-build-cache-cli
-docker-build-cache-cli: ## Build the cache-cli image.
-	$(CONTAINER_TOOL) build -t cache-cli:dev -f Dockerfile.cache-cli .
-
-.PHONY: kind-load-cache-cli
-kind-load-cache-cli: docker-build-cache-cli ## Build and load cache-cli into kind.
-	kind load docker-image cache-cli:dev --name dcache-dev
-
-##@ Kind cluster lifecycle
-
-
-
-.PHONY: kind-up
-kind-up: ## Create kind cluster with Calico CNI, install CRD, build & load images.
-	@kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || \
-	@kind create cluster --name $(KIND_CLUSTER) --config hack/kind-config.yaml
-	@kubectl config use-context kind-$(KIND_CLUSTER) >/dev/null
-	@echo "Installing Calico for NetworkPolicy enforcement..."
-	@kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
-	@echo "Waiting for Calico pods to be Ready (up to 3 min)..."
-	@kubectl rollout status -n kube-system daemonset/calico-node --timeout=180s
-	@kubectl rollout status -n kube-system deployment/calico-kube-controllers --timeout=180s
-	$(MAKE) install
-	$(MAKE) kind-load-tiny-cache
-	$(MAKE) kind-load-cache-cli
-	@echo
-	@echo "kind cluster '$(KIND_CLUSTER)' is up; CRD installed; images loaded; NetworkPolicy enforced via Calico."
-	@echo "kubectl context: $$(kubectl config current-context)"
-
-.PHONY: kind-down
-kind-down: ## Destroy the kind cluster.
-	kind delete cluster --name $(KIND_CLUSTER)
-
-# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
-# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
-# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
-# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
-	- $(CONTAINER_TOOL) buildx create --name distributed-cache-operator-builder
-	$(CONTAINER_TOOL) buildx use distributed-cache-operator-builder
+	- $(CONTAINER_TOOL) buildx create --name global-workload-orchestrator-builder
+	$(CONTAINER_TOOL) buildx use global-workload-orchestrator-builder
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
-	- $(CONTAINER_TOOL) buildx rm distributed-cache-operator-builder
+	- $(CONTAINER_TOOL) buildx rm global-workload-orchestrator-builder
 	rm Dockerfile.cross
 
 .PHONY: build-installer
@@ -198,7 +127,7 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" apply -f -; else echo "No CRDs to install; skipping."; fi
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
@@ -208,39 +137,34 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
-undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies
 
-## Location to install dependencies to
 LOCALBIN ?= $(shell pwd)/bin
 $(LOCALBIN):
 	mkdir -p "$(LOCALBIN)"
 
-## Tool Binaries
 KUBECTL ?= kubectl
 KIND ?= kind
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
-GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
-## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
+GOLANGCI_LINT_VERSION ?= v2.8.0
 
-#ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?([0-9]+)\.([0-9]+).*/release-\1.\2/')
 
-#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-GOLANGCI_LINT_VERSION ?= v2.8.0
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -266,19 +190,147 @@ $(ENVTEST): $(LOCALBIN)
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
 
+GOLANGCI_LINT_BOOTSTRAP := $(LOCALBIN)/golangci-lint-bootstrap-$(GOLANGCI_LINT_VERSION)
 
-##@ Tests
+$(GOLANGCI_LINT_BOOTSTRAP): | $(LOCALBIN)
+	@echo "Installing bootstrap golangci-lint $(GOLANGCI_LINT_VERSION)..."
+	GOBIN=$(LOCALBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv $(LOCALBIN)/golangci-lint $(GOLANGCI_LINT_BOOTSTRAP)
 
-.PHONY: test-e2e
-test-e2e: ## Run end-to-end tests against the current kubectl context.
-	@echo "Running e2e tests against $$(kubectl config current-context)..."
-	@echo "Prereqs: CRD installed, tiny-cache:dev loaded, operator running."
-	go test ./test/e2e/... -v -timeout 5m
+$(GOLANGCI_LINT): $(GOLANGCI_LINT_BOOTSTRAP) .custom-gcl.yml | $(LOCALBIN)
+	@echo "Building custom golangci-lint with plugins..."
+	$(GOLANGCI_LINT_BOOTSTRAP) custom \
+	    --destination $(LOCALBIN) \
+	    --name golangci-lint-custom
+	mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT)
+
+define go-install-tool
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f "$(1)" ;\
+GOBIN="$(LOCALBIN)" go install $${package} ;\
+mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
+} ;\
+ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
+endef
+
+define gomodver
+$(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
+endef
+
+##@ Demo
+
+KUBECONFIG_DIR ?= hack/kubeconfigs
+DEMO_NS ?= default
+
+.PHONY: demo-setup
+demo-setup: ## Provision three kind clusters, kubeconfigs, secrets, registrations
+	@echo "==> Creating kind clusters..."
+	kind create cluster --name mgmt || true
+	kind create cluster --name region-a || true
+	kind create cluster --name region-b || true
+	@echo "==> Exporting kubeconfigs..."
+	mkdir -p $(KUBECONFIG_DIR)
+	kind get kubeconfig --name region-a > $(KUBECONFIG_DIR)/region-a.kubeconfig
+	kind get kubeconfig --name region-b > $(KUBECONFIG_DIR)/region-b.kubeconfig
+	@echo "==> Switching to mgmt context..."
+	kubectl config use-context kind-mgmt
+	@echo "==> Installing CRDs into mgmt..."
+	$(MAKE) install
+	@echo "==> Creating kubeconfig secrets..."
+	kubectl create secret generic region-a-kubeconfig \
+		--from-file=kubeconfig=$(KUBECONFIG_DIR)/region-a.kubeconfig \
+		--dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic region-b-kubeconfig \
+		--from-file=kubeconfig=$(KUBECONFIG_DIR)/region-b.kubeconfig \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "==> Registering clusters..."
+	kubectl apply -f hack/clusters.yaml
+	@echo "==> Setup complete. Run 'make run' in another terminal, then 'make demo'."
+
+.PHONY: demo
+demo: ## Apply a sample GlobalWorkload and show placement across clusters
+	@echo "==> Applying sample GlobalWorkload..."
+	kubectl apply -f hack/sample-workload.yaml
+	@echo "==> Waiting for placement (5s)..."
+	@sleep 5
+	@echo ""
+	@echo "==> GlobalWorkload status:"
+	kubectl get globalworkload hello-workload -o yaml | grep -A 20 'status:'
+	@echo ""
+	@echo "==> Deployments in region-a:"
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-a.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload
+	@echo ""
+	@echo "==> Deployments in region-b:"
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-b.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload
+
+.PHONY: demo-failover
+demo-failover: ## Stop region-a's container to simulate a cluster failure
+	@echo "==> Stopping region-a's API server..."
+	docker stop region-a-control-plane
+	@echo ""
+	@echo "==> Watching for region-a to be marked unhealthy (up to 60s)..."
+	@for i in $$(seq 1 12); do \
+		HEALTHY=$$(kubectl get clusterregistration region-a -o jsonpath='{.status.healthy}' 2>/dev/null); \
+		if [ "$$HEALTHY" = "false" ]; then \
+			echo "    region-a is now UNHEALTHY (after $$((i*5))s)"; \
+			break; \
+		fi; \
+		echo "    [$$((i*5))s] region-a healthy=$$HEALTHY, waiting..."; \
+		sleep 5; \
+	done
+	@echo ""
+	@echo "==> Waiting for migration to complete (10s)..."
+	@sleep 10
+	@echo ""
+	@echo "==> Updated placement:"
+	kubectl get globalworkload hello-workload -o jsonpath='{.status.placements}' | jq
+	@echo ""
+	@echo "==> Replicas now in region-b:"
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-b.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload
+
+.PHONY: demo-recover
+demo-recover: ## Restart region-a and observe redistribution
+	@echo "==> Starting region-a's API server..."
+	docker start region-a-control-plane
+	@echo ""
+	@echo "==> Waiting for region-a to be marked healthy (up to 60s)..."
+	@for i in $$(seq 1 12); do \
+		HEALTHY=$$(kubectl get clusterregistration region-a -o jsonpath='{.status.healthy}' 2>/dev/null); \
+		if [ "$$HEALTHY" = "true" ]; then \
+			echo "    region-a is HEALTHY again (after $$((i*5))s)"; \
+			break; \
+		fi; \
+		echo "    [$$((i*5))s] region-a healthy=$$HEALTHY, waiting..."; \
+		sleep 5; \
+	done
+	@echo ""
+	@echo "==> Waiting for redistribution (10s)..."
+	@sleep 10
+	@echo ""
+	@echo "==> Restored placement:"
+	kubectl get globalworkload hello-workload -o jsonpath='{.status.placements}' | jq
+	@echo ""
+	@echo "==> Deployments now in both clusters:"
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-a.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-b.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload
+
+.PHONY: demo-clean
+demo-clean: ## Delete the demo workload (finalizer cleans target clusters)
+	@echo "==> Deleting GlobalWorkload (finalizer will clean target Deployments)..."
+	-kubectl delete globalworkload hello-workload --timeout=60s
+	@echo ""
+	@echo "==> Confirming Deployments are gone:"
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-a.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload 2>&1 | head -2
+	-kubectl --kubeconfig $(KUBECONFIG_DIR)/region-b.kubeconfig get deployment -n $(DEMO_NS) gwo-hello-workload 2>&1 | head -2
+
+.PHONY: demo-teardown
+demo-teardown: ## Destroy all three kind clusters
+	@echo "==> Deleting kind clusters..."
+	kind delete cluster --name mgmt || true
+	kind delete cluster --name region-a || true
+	kind delete cluster --name region-b || true
+	@echo "==> Teardown complete."
